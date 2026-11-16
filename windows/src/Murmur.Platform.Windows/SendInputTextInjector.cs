@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using Murmur.Abstractions;
 
 namespace Murmur.Platform.Windows;
@@ -47,6 +48,8 @@ public sealed class SendInputTextInjector : ITextInjector
     private const uint KEYEVENTF_UNICODE = 0x0004;
 
     private const int VK_CONTROL = 0x11;
+    private const int VK_LCONTROL = 0xA2;
+    private const int VK_RCONTROL = 0xA3;
     private const int VK_SHIFT = 0x10;
     private const int VK_MENU = 0x12;
     private const int VK_LWIN = 0x5B;
@@ -55,6 +58,10 @@ public sealed class SendInputTextInjector : ITextInjector
     private const int VK_RETURN = 0x0D;
 
     private const uint MAPVK_VK_TO_VSC = 0;
+    private const uint CfUnicodeText = 13;
+    private const uint GmemMoveable = 0x0002;
+    private const uint ProcessQueryLimitedInformation = 0x1000;
+    private const int ErrorInsufficientBuffer = 122;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MOUSEINPUT
@@ -105,6 +112,67 @@ public sealed class SendInputTextInjector : ITextInjector
     [DllImport("user32.dll", EntryPoint = "MapVirtualKeyW")]
     private static extern uint MapVirtualKey(uint code, uint mapType);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr window, char[] className, int capacity);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(
+        IntPtr process, uint flags, char[] name, ref int size);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetPackageFullName(IntPtr process, ref int length, char[]? buffer);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenClipboard(IntPtr owner);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EmptyClipboard();
+
+    [DllImport("user32.dll")]
+    private static extern uint EnumClipboardFormats(uint format);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetClipboardData(uint format);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetClipboardData(uint format, IntPtr memory);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalLock(IntPtr memory);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(IntPtr memory);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GlobalFree(IntPtr memory);
+
+    [DllImport("kernel32.dll")]
+    private static extern nuint GlobalSize(IntPtr memory);
+
     private static readonly int InputSize = Marshal.SizeOf<INPUT>();
 
     /// <summary>Called to place text on the clipboard and paste it.</summary>
@@ -120,21 +188,268 @@ public sealed class SendInputTextInjector : ITextInjector
     {
         if (string.IsNullOrEmpty(text)) return true;
 
+        // A newline is Enter. A vertical tab is a line gap: two Enters, one double knock.
+        // Ctrl is lifted inside PressEnter so Word and Docs do not make a page break.
+        bool inserted;
+        var textLanded = false;
+        var lineBreaks = 0;
+        var lineGaps = 0;
+        if (!text.Contains('\n', StringComparison.Ordinal) && !text.Contains('\v', StringComparison.Ordinal))
+        {
+            inserted = await InjectChunkAsync(text, cancellationToken).ConfigureAwait(false);
+            textLanded = inserted;
+        }
+        else
+        {
+            inserted = true;
+            var pending = new StringBuilder();
+            async ValueTask FlushAsync()
+            {
+                if (pending.Length == 0) return;
+                var chunk = await InjectChunkAsync(pending.ToString(), cancellationToken).ConfigureAwait(false);
+                pending.Clear();
+                inserted &= chunk;
+                textLanded |= chunk;
+            }
+
+            foreach (var unit in text.Replace("\r\n", "\n", StringComparison.Ordinal))
+            {
+                if (unit == '\n')
+                {
+                    await FlushAsync().ConfigureAwait(false);
+                    var broke = PressEnter();
+                    inserted &= broke;
+                    if (broke) lineBreaks++;
+                    continue;
+                }
+
+                if (unit == '\v')
+                {
+                    await FlushAsync().ConfigureAwait(false);
+                    var first = PressEnter();
+                    var second = first && PressEnter();
+                    inserted &= first && second;
+                    if (second) lineGaps++;
+                    continue;
+                }
+
+                pending.Append(unit);
+            }
+
+            await FlushAsync().ConfigureAwait(false);
+        }
+
+        if (textLanded) InsertCue.PlayText();
+        for (var n = 0; n < lineBreaks; n++) InsertCue.PlayLineBreak();
+        for (var n = 0; n < lineGaps; n++) InsertCue.PlayLineGap();
+        return inserted;
+    }
+
+    private async ValueTask<bool> InjectChunkAsync(string text, CancellationToken cancellationToken)
+    {
         // Newlines sent as Unicode packets do not reliably produce a new line — many controls
         // want a real VK_RETURN. Long text goes to the clipboard anyway, which handles them.
+        // OneNote and the Store Notes apps drop Unicode packets entirely, so those get a paste
+        // even when the transcript is a single short line.
         var hasNewlines = text.Contains('\n', StringComparison.Ordinal);
+        var paste = text.Length > PasteThreshold || hasNewlines || ForegroundNeedsPaste();
 
-        if (text.Length <= PasteThreshold && !hasNewlines)
-        {
-            return TypeUnicode(text);
-        }
+        if (!paste) return TypeUnicode(text);
 
         if (ClipboardPaste is not null)
         {
             return await ClipboardPaste(text, cancellationToken).ConfigureAwait(false);
         }
 
-        return TypeWithNewlines(text);
+        return PasteWithClipboard(text) || TypeWithNewlines(text);
+    }
+
+    /// <summary>
+    /// True when the focused window will ignore Unicode key packets.
+    /// </summary>
+    /// <remarks>
+    /// OneNote's page is a custom editor (<c>Framework::CFrame</c>) that never turns those
+    /// packets into characters. Sticky Notes and other Store apps are hosted in
+    /// <c>ApplicationFrameWindow</c> and do the same. A paste is the input both accept.
+    /// </remarks>
+    private static bool ForegroundNeedsPaste()
+    {
+        var window = GetForegroundWindow();
+        if (window == IntPtr.Zero) return false;
+
+        var className = new char[256];
+        var classLength = GetClassName(window, className, className.Length);
+        if (classLength > 0 && new string(className, 0, classLength) is "ApplicationFrameWindow" or "Windows.UI.Core.CoreWindow" or "Framework::CFrame")
+        {
+            return true;
+        }
+
+        _ = GetWindowThreadProcessId(window, out var processId);
+        var process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+        if (process == IntPtr.Zero) return false;
+
+        try
+        {
+            var length = 0;
+            var packaged = GetPackageFullName(process, ref length, null);
+            if (packaged == ErrorInsufficientBuffer) return true;
+
+            var image = new char[1024];
+            var size = image.Length;
+            if (!QueryFullProcessImageName(process, 0, image, ref size) || size <= 0) return false;
+
+            var file = Path.GetFileName(new string(image, 0, size));
+            return file.Equals("ONENOTE.EXE", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("ONENOTEM.EXE", StringComparison.OrdinalIgnoreCase)
+                || file.Equals("ApplicationFrameHost.exe", StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            _ = CloseHandle(process);
+        }
+    }
+
+    /// <summary>Puts <paramref name="text"/> on the clipboard and presses Ctrl+V.</summary>
+    private static bool PasteWithClipboard(string text)
+    {
+        var previous = CaptureClipboard();
+        if (!SetClipboardText(text)) return false;
+
+        Thread.Sleep(ClipboardSettle);
+        var pasted = PressCtrlV();
+        // OneNote reads the clipboard after the keystroke has come back through its own
+        // queue. Restoring any sooner pastes whatever was on the clipboard before.
+        Thread.Sleep(TimeSpan.FromMilliseconds(1000));
+        if (previous is not null) RestoreClipboard(previous);
+        return pasted;
+    }
+
+    private static List<(uint Format, byte[] Bytes)>? CaptureClipboard()
+    {
+        if (!OpenClipboardForUse()) return null;
+
+        try
+        {
+            var items = new List<(uint, byte[])>();
+            uint format = 0;
+            while ((format = EnumClipboardFormats(format)) != 0)
+            {
+                var data = GetClipboardData(format);
+                if (data == IntPtr.Zero) continue;
+
+                var size = GlobalSize(data);
+                if (size == 0 || size > 8 * 1024 * 1024) continue;
+
+                var pointer = GlobalLock(data);
+                if (pointer == IntPtr.Zero) continue;
+
+                try
+                {
+                    var bytes = new byte[size];
+                    Marshal.Copy(pointer, bytes, 0, (int)size);
+                    items.Add((format, bytes));
+                }
+                finally
+                {
+                    _ = GlobalUnlock(data);
+                }
+            }
+
+            return items;
+        }
+        finally
+        {
+            _ = CloseClipboard();
+        }
+    }
+
+    private static bool SetClipboardText(string text)
+    {
+        if (!OpenClipboardForUse()) return false;
+
+        try
+        {
+            if (!EmptyClipboard()) return false;
+
+            var bytes = (text.Length + 1) * sizeof(char);
+            var memory = GlobalAlloc(GmemMoveable, (UIntPtr)bytes);
+            if (memory == IntPtr.Zero) return false;
+
+            var pointer = GlobalLock(memory);
+            if (pointer == IntPtr.Zero)
+            {
+                _ = GlobalFree(memory);
+                return false;
+            }
+
+            try
+            {
+                Marshal.Copy(text.ToCharArray(), 0, pointer, text.Length);
+                Marshal.WriteInt16(pointer, text.Length * sizeof(char), 0);
+            }
+            finally
+            {
+                _ = GlobalUnlock(memory);
+            }
+
+            if (SetClipboardData(CfUnicodeText, memory) != IntPtr.Zero) return true;
+
+            _ = GlobalFree(memory);
+            return false;
+        }
+        finally
+        {
+            _ = CloseClipboard();
+        }
+    }
+
+    private static void RestoreClipboard(List<(uint Format, byte[] Bytes)> items)
+    {
+        if (!OpenClipboardForUse()) return;
+
+        try
+        {
+            if (!EmptyClipboard()) return;
+
+            foreach (var (format, bytes) in items)
+            {
+                var memory = GlobalAlloc(GmemMoveable, (UIntPtr)bytes.Length);
+                if (memory == IntPtr.Zero) continue;
+
+                var pointer = GlobalLock(memory);
+                if (pointer == IntPtr.Zero)
+                {
+                    _ = GlobalFree(memory);
+                    continue;
+                }
+
+                try
+                {
+                    Marshal.Copy(bytes, 0, pointer, bytes.Length);
+                }
+                finally
+                {
+                    _ = GlobalUnlock(memory);
+                }
+
+                if (SetClipboardData(format, memory) == IntPtr.Zero) _ = GlobalFree(memory);
+            }
+        }
+        finally
+        {
+            _ = CloseClipboard();
+        }
+    }
+
+    private static bool OpenClipboardForUse()
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            if (OpenClipboard(IntPtr.Zero)) return true;
+            Thread.Sleep(15);
+        }
+
+        return false;
     }
 
     /// <summary>Types arbitrary text as Unicode packets.</summary>
@@ -210,19 +525,55 @@ public sealed class SendInputTextInjector : ITextInjector
             if ((GetAsyncKeyState(key) & 0x8000) != 0) held.Add(key);
         }
 
-        var sequence = new List<INPUT>();
-        foreach (var key in held) sequence.Add(KeyInput(key, up: true));
+        foreach (var key in held)
+        {
+            if (!Tap(KeyInput(key, up: true))) return false;
+        }
 
-        sequence.Add(KeyInput(VK_CONTROL, up: false));
-        sequence.Add(KeyInput(VK_V, up: false));
-        sequence.Add(KeyInput(VK_V, up: true));
-        sequence.Add(KeyInput(VK_CONTROL, up: true));
+        // Separate events, with a gap. OneNote drops a Ctrl+V that arrives as one packet.
+        if (!Tap(KeyInput(VK_CONTROL, up: false))) return false;
+        Thread.Sleep(30);
+        if (!Tap(KeyInput(VK_V, up: false))) return false;
+        Thread.Sleep(30);
+        if (!Tap(KeyInput(VK_V, up: true))) return false;
+        Thread.Sleep(30);
+        if (!Tap(KeyInput(VK_CONTROL, up: true))) return false;
 
-        foreach (var key in held) sequence.Add(KeyInput(key, up: false));
+        foreach (var key in held)
+        {
+            if (!Tap(KeyInput(key, up: false))) return false;
+        }
 
-        var inputs = sequence.ToArray();
-        return SendInput((uint)inputs.Length, inputs, InputSize) == inputs.Length;
+        return true;
     }
+
+    /// <summary>Presses Enter, lifting Ctrl so Word and Docs do not turn it into a page break.</summary>
+    private static bool PressEnter()
+    {
+        var held = new List<int>();
+        foreach (var key in new[] { VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN, VK_CONTROL, VK_LCONTROL, VK_RCONTROL })
+        {
+            if ((GetAsyncKeyState(key) & 0x8000) != 0) held.Add(key);
+        }
+
+        foreach (var key in held)
+        {
+            if (!Tap(KeyInput(key, up: true))) return false;
+        }
+
+        if (!Tap(KeyInput(VK_RETURN, up: false))) return false;
+        Thread.Sleep(30);
+        if (!Tap(KeyInput(VK_RETURN, up: true))) return false;
+
+        foreach (var key in held)
+        {
+            if (!Tap(KeyInput(key, up: false))) return false;
+        }
+
+        return true;
+    }
+
+    private static bool Tap(INPUT input) => SendInput(1, [input], InputSize) == 1;
 
     /// <summary>How long to wait after setting the clipboard before pasting.</summary>
     public static TimeSpan ClipboardSettleDelay => ClipboardSettle;

@@ -4,7 +4,6 @@ using System.Threading.Channels;
 using Murmur.Abstractions;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
-using NAudio.Wave.SampleProviders;
 
 namespace Murmur.Platform.Windows;
 
@@ -13,16 +12,16 @@ namespace Murmur.Platform.Windows;
 /// </summary>
 /// <remarks>
 /// <para>
-/// WASAPI shared mode normally pins you to the engine mix format (typically 48 kHz stereo),
-/// but <c>AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM</c> inserts a channel matrixer and a sample-rate
-/// converter, and NAudio's <see cref="WasapiCapture"/> sets that flag unconditionally. So the
-/// first attempt simply asks the OS for the format the model wants.
+/// The capture device is the user's default recording device (<c>Role.Console</c>), not the
+/// default communications device. Windows keeps those separate, and a virtual communications
+/// endpoint such as SteelSeries Sonar can stay selected while the headset the user just chose
+/// is the console default — and the virtual one returns silence.
 /// </para>
 /// <para>
-/// The flag is named AUTOCONVERT<b>PCM</b> and the docs do not say whether IEEE float is
-/// accepted as a client format. Since this cannot be tested here, the code tries three
-/// formats in order and falls back to converting in managed code. All three paths produce the
-/// same thing, so callers never see the difference.
+/// The stream is opened in the device's mix format and converted in managed code. Asking
+/// WASAPI for 16 kHz directly does open, but on a real headset it came back about 70× quieter
+/// than the same mic in its native format, which leaves the meter stuck and the model with
+/// nothing it can transcribe.
 /// </para>
 /// </remarks>
 public sealed class WasapiAudioCapture : IAudioCapture
@@ -33,10 +32,8 @@ public sealed class WasapiAudioCapture : IAudioCapture
     private WasapiCapture? _capture;
 
     private Channel<float[]>? _channel;
-    private BufferedWaveProvider? _rawSink;
-    private WdlResamplingSampleProvider? _pipeline;
+    private WaveFormat? _sourceFormat;
     private bool _nativeTargetFormat;
-    private float[] _pullBuffer = [];
 
     /// <summary>Captures from a specific device, or the default when null.</summary>
     /// <param name="deviceId">An <c>MMDevice.ID</c>, or null for the system default.</param>
@@ -83,9 +80,7 @@ public sealed class WasapiAudioCapture : IAudioCapture
     {
         using var enumerator = new MMDeviceEnumerator();
         var device = _deviceId is null
-            // Communications, not Console: this follows the device the user chose as their
-            // default *communication* device, which is what headset users expect.
-            ? enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications)
+            ? DefaultCaptureDevice(enumerator)
             : enumerator.GetDevice(_deviceId);
 
         // Bounded and drop-oldest so a slow consumer can never block the capture thread.
@@ -119,7 +114,7 @@ public sealed class WasapiAudioCapture : IAudioCapture
                     capture.WaveFormat.Channels == 1 &&
                     capture.WaveFormat.Encoding == WaveFormatEncoding.IeeeFloat;
 
-                if (!_nativeTargetFormat) BuildManagedConverter(capture.WaveFormat);
+                if (!_nativeTargetFormat) _sourceFormat = capture.WaveFormat;
 
                 _capture = capture;
                 IsCapturing = true;
@@ -136,41 +131,40 @@ public sealed class WasapiAudioCapture : IAudioCapture
         throw new InvalidOperationException("Could not open the microphone in any supported format.");
     }
 
+    /// <summary>
+    /// The recording device Windows sound settings calls the default.
+    /// </summary>
+    /// <remarks>
+    /// Console first, then multimedia, then communications. Communications is a second
+    /// default, and it is the one a virtual cable tends to keep after the user has pointed
+    /// the real default at a headset.
+    /// </remarks>
+    private static MMDevice DefaultCaptureDevice(MMDeviceEnumerator enumerator)
+    {
+        foreach (var role in new[] { Role.Console, Role.Multimedia, Role.Communications })
+        {
+            try
+            {
+                return enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, role);
+            }
+            catch (COMException)
+            {
+                // This role has no default. Try the next one.
+            }
+        }
+
+        throw new InvalidOperationException("No capture device is available.");
+    }
+
     /// <summary>Formats to try, best first.</summary>
     private static IEnumerable<WaveFormat> Formats(MMDevice device)
     {
-        // Exactly what the model wants — the OS resamples for us if it accepts this.
-        yield return WaveFormat.CreateIeeeFloatWaveFormat(AudioChunk.SampleRate, 1);
-
-        // Right rate and channel count, integer samples. Cheap to convert.
-        yield return new WaveFormat(AudioChunk.SampleRate, 16, 1);
-
-        // Whatever the engine is already running at; we convert in managed code.
+        // Native mix format. Managed resampling keeps the amplitude the mic actually produced.
         yield return device.AudioClient.MixFormat;
-    }
 
-    private void BuildManagedConverter(WaveFormat source)
-    {
-        _rawSink = new BufferedWaveProvider(source)
-        {
-            BufferDuration = TimeSpan.FromSeconds(3),
-            DiscardOnBufferOverflow = true,
-        };
-
-        ISampleProvider provider = _rawSink.ToSampleProvider();
-        if (source.Channels == 2)
-        {
-            provider = new StereoToMonoSampleProvider(provider) { LeftVolume = 0.5f, RightVolume = 0.5f };
-        }
-        else if (source.Channels > 2)
-        {
-            provider = new DownmixSampleProvider(provider);
-        }
-
-        // WDL, not MediaFoundationResampler: pure managed, so no COM apartment concerns and
-        // nothing extra to extract from a single-file bundle.
-        _pipeline = new WdlResamplingSampleProvider(provider, AudioChunk.SampleRate);
-        _pullBuffer = new float[AudioChunk.SampleRate / 10];
+        // Only if the mix format itself will not open.
+        yield return WaveFormat.CreateIeeeFloatWaveFormat(AudioChunk.SampleRate, 1);
+        yield return new WaveFormat(AudioChunk.SampleRate, 16, 1);
     }
 
     /// <summary>
@@ -195,20 +189,82 @@ public sealed class WasapiAudioCapture : IAudioCapture
             return;
         }
 
-        _rawSink!.AddSamples(e.Buffer, 0, e.BytesRecorded);   // AddSamples copies internally
-
-        // Drain until the resampler starves. A zero read means "no more buffered input right
-        // now" — it is not end-of-stream and not an error.
-        while (true)
-        {
-            var read = _pipeline!.Read(_pullBuffer, 0, _pullBuffer.Length);
-            if (read == 0) return;
-
-            var owned = new float[read];
-            Array.Copy(_pullBuffer, owned, read);
-            Publish(owned);
-        }
+        Publish(ToModelFormat(e.Buffer, e.BytesRecorded, _sourceFormat!));
     }
+
+    /// <summary>
+    /// Turns one captured buffer into 16 kHz mono float, using only the bytes just recorded.
+    /// </summary>
+    private static float[] ToModelFormat(byte[] buffer, int bytes, WaveFormat format)
+    {
+        var encoding = format.Encoding;
+        if (format is WaveFormatExtensible extensible)
+        {
+            if (extensible.SubFormat == IeeeFloatSubType) encoding = WaveFormatEncoding.IeeeFloat;
+            else if (extensible.SubFormat == PcmSubType) encoding = WaveFormatEncoding.Pcm;
+        }
+
+        var channels = Math.Max(1, format.Channels);
+        int frames;
+        var mono = encoding == WaveFormatEncoding.Pcm
+            ? PcmToMono(buffer, bytes, channels, out frames)
+            : FloatToMono(buffer, bytes, channels, out frames);
+
+        if (frames == 0 || format.SampleRate == AudioChunk.SampleRate) return mono;
+
+        var outFrames = (int)((long)frames * AudioChunk.SampleRate / format.SampleRate);
+        if (outFrames <= 0) return [];
+
+        var resampled = new float[outFrames];
+        var step = (double)format.SampleRate / AudioChunk.SampleRate;
+        for (var i = 0; i < outFrames; i++)
+        {
+            var position = i * step;
+            var left = (int)position;
+            var right = Math.Min(left + 1, frames - 1);
+            var fraction = (float)(position - left);
+            resampled[i] = (mono[left] * (1f - fraction)) + (mono[right] * fraction);
+        }
+
+        return resampled;
+    }
+
+    private static float[] FloatToMono(byte[] buffer, int bytes, int channels, out int frames)
+    {
+        frames = bytes / (sizeof(float) * channels);
+        var mono = new float[frames];
+        var samples = MemoryMarshal.Cast<byte, float>(buffer.AsSpan(0, frames * channels * sizeof(float)));
+        for (var frame = 0; frame < frames; frame++)
+        {
+            float sum = 0;
+            for (var channel = 0; channel < channels; channel++) sum += samples[(frame * channels) + channel];
+            mono[frame] = sum / channels;
+        }
+
+        return mono;
+    }
+
+    private static float[] PcmToMono(byte[] buffer, int bytes, int channels, out int frames)
+    {
+        frames = bytes / (sizeof(short) * channels);
+        var mono = new float[frames];
+        var samples = MemoryMarshal.Cast<byte, short>(buffer.AsSpan(0, frames * channels * sizeof(short)));
+        for (var frame = 0; frame < frames; frame++)
+        {
+            float sum = 0;
+            for (var channel = 0; channel < channels; channel++)
+            {
+                sum += samples[(frame * channels) + channel] / 32768f;
+            }
+
+            mono[frame] = sum / channels;
+        }
+
+        return mono;
+    }
+
+    private static readonly Guid IeeeFloatSubType = new("00000003-0000-0010-8000-00AA00389B71");
+    private static readonly Guid PcmSubType = new("00000001-0000-0010-8000-00AA00389B71");
 
     private void Publish(float[] samples)
     {
@@ -257,49 +313,5 @@ public sealed class WasapiAudioCapture : IAudioCapture
     {
         StopCapture();
         return ValueTask.CompletedTask;
-    }
-}
-
-/// <summary>
-/// Averages an arbitrary number of channels down to one.
-/// </summary>
-/// <remarks>
-/// NAudio's <see cref="StereoToMonoSampleProvider"/> handles exactly two channels. USB audio
-/// interfaces routinely present four or eight.
-/// </remarks>
-internal sealed class DownmixSampleProvider : ISampleProvider
-{
-    private readonly ISampleProvider _source;
-    private readonly int _channels;
-    private float[] _buffer = [];
-
-    public DownmixSampleProvider(ISampleProvider source)
-    {
-        _source = source;
-        _channels = source.WaveFormat.Channels;
-        WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(source.WaveFormat.SampleRate, 1);
-    }
-
-    public WaveFormat WaveFormat { get; }
-
-    public int Read(float[] buffer, int offset, int count)
-    {
-        var needed = count * _channels;
-        if (_buffer.Length < needed) _buffer = new float[needed];
-
-        var read = _source.Read(_buffer, 0, needed);
-        var frames = read / _channels;
-
-        for (var frame = 0; frame < frames; frame++)
-        {
-            float sum = 0;
-            for (var channel = 0; channel < _channels; channel++)
-            {
-                sum += _buffer[(frame * _channels) + channel];
-            }
-            buffer[offset + frame] = sum / _channels;
-        }
-
-        return frames;
     }
 }

@@ -191,6 +191,21 @@ public sealed class TranscriptStoreTests : IDisposable
     }
 
     [Fact]
+    public void Replacing_a_record_keeps_its_place_and_persists()
+    {
+        var store = new TranscriptStore(_path);
+        store.Add(Record("older"));
+        store.Add(Record("hello"));
+
+        var current = store.Records.Single(r => r.Text == "hello");
+        store.Replace(current with { Text = "hello world" });
+
+        var reopened = new TranscriptStore(_path);
+        reopened.Records.Select(r => r.Text).ShouldBe(["hello world", "older"]);
+        reopened.Records[0].Id.ShouldBe(current.Id);
+    }
+
+    [Fact]
     public void Clear_empties_the_file()
     {
         var store = new TranscriptStore(_path);
@@ -236,5 +251,19 @@ public sealed class AppSettingsTests : IDisposable
         File.WriteAllText(_path, "{ not json at all");
 
         new AppSettings(_path).Data.PushToTalkKey.ShouldBe(0xA3);
+    }
+
+    [Fact]
+    public void A_file_written_before_the_on_top_flag_still_keeps_it_on()
+    {
+        File.WriteAllText(_path, """
+            {
+              "PushToTalkKey": 163,
+              "InjectText": true,
+              "KeepHistory": true
+            }
+            """);
+
+        new AppSettings(_path).Data.StayOnTopWhileRecording.ShouldBeTrue();
     }
 }

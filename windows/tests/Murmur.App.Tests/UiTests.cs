@@ -1,11 +1,14 @@
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
+using Avalonia.Interactivity;
 using Avalonia.Headless.XUnit;
 using Avalonia.Themes.Fluent;
+using Avalonia.VisualTree;
 using Murmur.App.Controls;
 using Murmur.App.Design;
 using Murmur.App.Views;
+using Murmur.Core;
 using Shouldly;
 
 [assembly: AvaloniaTestApplication(typeof(Murmur.AppTests.TestAppBuilder))]
@@ -70,6 +73,47 @@ public sealed class MainWindowTests
     }
 
     [AvaloniaFact]
+    public void Panel_closes_on_its_own_and_recording_reopens_it()
+    {
+        var window = new MainWindow();
+        window.Show();
+
+        TransportKey Key(string label) => window.GetVisualDescendants()
+            .OfType<TransportKey>()
+            .First(key => key.Content as string == label);
+
+        static bool OnScreen(Control control)
+        {
+            for (Control? node = control; node is not null; node = node.Parent as Control)
+            {
+                if (!node.IsVisible) return false;
+            }
+
+            return true;
+        }
+
+        var transcriptions = Key("TRANSCRIPTIONS");
+        OnScreen(transcriptions).ShouldBeTrue();
+
+        Key("CLOSE").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        window.UpdateLayout();
+
+        OnScreen(transcriptions).ShouldBeFalse();
+        Key("OPEN").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        window.UpdateLayout();
+        OnScreen(transcriptions).ShouldBeTrue();
+
+        window.ToggleRecording();
+        window.UpdateLayout();
+        OnScreen(transcriptions).ShouldBeFalse();
+
+        window.ToggleRecording();
+        window.UpdateLayout();
+        OnScreen(transcriptions).ShouldBeTrue();
+        window.MinHeight.ShouldBe(520);
+    }
+
+    [AvaloniaFact]
     public void Window_honours_its_minimum_size()
     {
         var window = new MainWindow();
@@ -77,6 +121,54 @@ public sealed class MainWindowTests
 
         window.MinWidth.ShouldBe(720);
         window.MinHeight.ShouldBe(520);
+    }
+
+    [AvaloniaFact]
+    public void Transcriptions_are_grouped_under_a_date()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"murmur-dates-{Guid.NewGuid():N}.jsonl");
+        try
+        {
+            var store = new TranscriptStore(path);
+            var today = DateTimeOffset.Now;
+            store.Add(new TranscriptRecord { At = today.AddDays(-1), Text = "older" });
+            store.Add(new TranscriptRecord { At = today, Text = "newer one" });
+            store.Add(new TranscriptRecord { At = today.AddMinutes(-1), Text = "newer two" });
+
+            var view = new TranscriptionsView(store);
+            var window = new Window { Content = view, Width = 720, Height = 520 };
+            window.Show();
+
+            var labels = view.GetVisualDescendants()
+                .OfType<Silkscreen>()
+                .Select(label => label.Text)
+                .ToArray();
+
+            labels.Count(text => text == "TODAY").ShouldBe(1);
+            labels.ShouldContain("YESTERDAY");
+
+            var text = view.GetVisualDescendants().OfType<TextBlock>().Select(block => block.Text).ToArray();
+            text.ShouldContain("newer one");
+            text.ShouldNotContain("older");
+
+            var yesterday = view.GetVisualDescendants().OfType<Button>().First(button =>
+                button.GetVisualDescendants().OfType<Silkscreen>().Any(label => label.Text == "YESTERDAY"));
+            yesterday.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            window.UpdateLayout();
+
+            view.GetVisualDescendants().OfType<TextBlock>().Select(block => block.Text).ShouldContain("older");
+
+            yesterday = view.GetVisualDescendants().OfType<Button>().First(button =>
+                button.GetVisualDescendants().OfType<Silkscreen>().Any(label => label.Text == "YESTERDAY"));
+            yesterday.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            window.UpdateLayout();
+
+            view.GetVisualDescendants().OfType<TextBlock>().Select(block => block.Text).ShouldNotContain("older");
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
     }
 }
 
@@ -128,8 +220,8 @@ public sealed class EquipmentTests
     [AvaloniaFact]
     public void Meter_renders_without_throwing()
     {
-        // The VU meter does all its own drawing, including a damped needle stepped by a
-        // timer. Constructing and showing it is what proves the render path is sound.
+        // The level wave draws itself, stepped by a timer. Constructing and showing it
+        // is what proves the render path is sound.
         var meter = new VuMeter { Width = 168, Height = 54, Level = 0.6 };
         var window = new Window { Content = meter };
         window.Show();

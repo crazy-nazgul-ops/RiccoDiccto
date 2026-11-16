@@ -137,9 +137,18 @@ internal static class Panels
     }
 
     /// <summary>A silkscreen label above a control, the way a panel is printed.</summary>
-    public static StackPanel Labelled(string label, Control content) => new()
+    /// <param name="label">The printed caption.</param>
+    /// <param name="content">What the caption names.</param>
+    /// <param name="ink">Caption colour. The panel ink when omitted.</param>
+    public static StackPanel Labelled(string label, Control content, IBrush? ink = null)
     {
-        Spacing = Tokens.Space.Tight,
-        Children = { new Silkscreen { Text = label }, content },
-    };
+        var caption = new Silkscreen { Text = label };
+        if (ink is not null) caption.Foreground = ink;
+
+        return new StackPanel
+        {
+            Spacing = Tokens.Space.Tight,
+            Children = { caption, content },
+        };
+    }
 }

@@ -5,6 +5,10 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <RootNamespace>Murmur.Platform.Windows</RootNamespace>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <!-- This assembly is loaded by reflection, so the app never sees these dependencies
+         through a normal project reference. They have to land in this project's output,
+         where the publish target picks them up and bundles them. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>

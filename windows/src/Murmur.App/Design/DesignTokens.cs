@@ -48,8 +48,32 @@ public static class Tokens
         /// <summary>The outer body of the unit. Darkest surface; frames everything.</summary>
         public static Color Chassis => Face(0x2A2825, 0x121110);
 
+        /// <summary>Frame around the floating transport strip. Dusk sand, then lampblack.</summary>
+        public static Color TransportChassis => Face(0x6E5E48, 0x0E0C0A);
+
         /// <summary>The main working surface.</summary>
         public static Color Panel => Face(0xB8B4AD, 0x2E2C29);
+
+        /// <summary>The transport strip. Bleached sandstone in light, lampblack in dark.</summary>
+        public static Color Transport => Face(0xC9B89A, 0x1A1612);
+
+        /// <summary>Top edge of the transport strip, where the brass catches.</summary>
+        public static Color TransportHighlight => Face(0xE2D4B8, 0x3A3228);
+
+        /// <summary>Shade under a raised piece on the transport strip.</summary>
+        public static Color TransportShade => Face(0xA89068, 0x0A0908);
+
+        /// <summary>Brass inlay on the transport strip.</summary>
+        public static Color TransportSeam => Face(0x8A6840, 0x8A7048);
+
+        /// <summary>The counter window. A night field in both faces.</summary>
+        public static Color TransportDeck => Face(0x1A1612, 0x0C0A08);
+
+        /// <summary>Sand cap of a key that sits on the transport strip.</summary>
+        public static Color TransportCap => Face(0xE6D7BC, 0x3A3228);
+
+        /// <summary>Brass ink printed on the transport strip.</summary>
+        public static Color TransportBrass => Face(0x6A4E28, 0xC4A56A);
 
         /// <summary>Top bevel highlight on a raised element.</summary>
         public static Color PanelHighlight => Face(0xC9C5BE, 0x3C3936);
@@ -130,6 +154,21 @@ public static class Tokens
     {
         /// <inheritdoc cref="Colors.Chassis"/>
         public static IBrush Chassis => new SolidColorBrush(Colors.Chassis);
+
+        /// <inheritdoc cref="Colors.TransportChassis"/>
+        public static IBrush TransportChassis => new SolidColorBrush(Colors.TransportChassis);
+
+        /// <inheritdoc cref="Colors.Transport"/>
+        public static IBrush Transport => new SolidColorBrush(Colors.Transport);
+
+        /// <inheritdoc cref="Colors.TransportDeck"/>
+        public static IBrush TransportDeck => new SolidColorBrush(Colors.TransportDeck);
+
+        /// <inheritdoc cref="Colors.TransportCap"/>
+        public static IBrush TransportCap => new SolidColorBrush(Colors.TransportCap);
+
+        /// <inheritdoc cref="Colors.TransportBrass"/>
+        public static IBrush TransportBrass => new SolidColorBrush(Colors.TransportBrass);
 
         /// <inheritdoc cref="Colors.Panel"/>
         public static IBrush Panel => new SolidColorBrush(Colors.Panel);
@@ -293,6 +332,15 @@ public static class Tokens
         /// <summary>Gap between vent slots.</summary>
         public const double VentSlotGap = 4;
 
+        /// <summary>How far the counter's arch rises above its springing line.</summary>
+        public const double ArchRise = 12;
+
+        /// <summary>Distance between the hairline stars on the transport face.</summary>
+        public const double StarPitch = 32;
+
+        /// <summary>How strongly those stars read against the ground.</summary>
+        public const double StarOpacity = 0.45;
+
         /// <summary>Indicator lamp diameter.</summary>
         public const double LampSize = 7;
 
@@ -311,14 +359,17 @@ public static class Tokens
         /// <summary>How far a key sinks when pressed.</summary>
         public const double KeyTravel = 1.5;
 
-        /// <summary>Total sweep of the VU needle, in degrees, centred on vertical.</summary>
-        public const double NeedleSweepDegrees = 96;
-
-        /// <summary>Needle thickness.</summary>
+        /// <summary>Needle thickness. Also the level wave.</summary>
         public const double NeedleWidth = 1.5;
 
-        /// <summary>Where 0 VU sits along the scale, 0…1. The red zone begins here.</summary>
+        /// <summary>Where 0 VU sits along the scale, 0…1. The amber zone begins here.</summary>
         public const double MeterZeroPoint = 0.72;
+
+        /// <summary>How many wave cycles fit across the level display.</summary>
+        public const double WaveCycles = 3;
+
+        /// <summary>How far the wave travels, in radians, on each frame.</summary>
+        public const double WaveSpeed = 0.22;
     }
 
     // ---- Motion ----

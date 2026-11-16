@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
+using Avalonia.Threading;
 using Murmur.App.Views;
 
 namespace Murmur.App;
@@ -24,17 +25,32 @@ public partial class App : Application
             _main = new MainWindow(_composition);
             desktop.MainWindow = _main;
 
-            // Closing the window leaves Murmur running in the tray — the hotkey still works,
-            // which is the whole point of a dictation app. Quit is explicit, from the tray
-            // menu or the app menu.
-            desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            // A second double-click finds the process already running and asks for this window,
+            // instead of starting another hook.
+            SingleInstance.Listen(() => Dispatcher.UIThread.Post(ShowMain));
+
+            // Closing the window quits. Leaving the process up for a tray icon that often
+            // never appeared is how extra copies kept the microphone and the hook, and then
+            // each of them typed the same utterance.
+            desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+            _main.Closed += (_, _) => desktop.Shutdown();
 
             // Disposing tears down the keyboard hook and releases the audio device. Leaving
             // a low-level hook installed after exit is the kind of thing that makes a
             // machine feel broken until it is rebooted.
             desktop.ShutdownRequested += (_, _) =>
             {
-                _composition?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                // Dispose runs inside the window callback. An exception here is fatal to
+                // the process, which skips the rest of shutdown.
+                try
+                {
+                    _composition?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    System.Diagnostics.Trace.WriteLine(ex);
+                }
+
                 _composition = null;
             };
         }

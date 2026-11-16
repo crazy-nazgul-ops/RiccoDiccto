@@ -1,4 +1,5 @@
-using System.Buffers;
+using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using Murmur.Abstractions;
 using Murmur.Dictionary;
 
@@ -26,7 +27,7 @@ public sealed record DictationResult(
     IReadOnlyList<AppliedCorrection> Corrections);
 
 /// <summary>
-/// The whole dictation flow: hotkey down, capture, hotkey up, transcribe, correct, inject.
+/// The whole dictation flow: hotkey, capture, hotkey again, transcribe, correct, inject.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -48,11 +49,53 @@ public sealed class DictationEngine : IAsyncDisposable
     private readonly ITextInjector _injector;
     private readonly IClock _clock;
     private readonly Func<IReadOnlyList<DictionaryEntry>> _dictionary;
+    private readonly ISessionCue? _cues;
+    private readonly IRecordCue? _recordCue;
+    private int _awaitingReadyCue;
+
+    /// <summary>No capture chunk for this long means the microphone side has stalled.</summary>
+    private static readonly TimeSpan AudioStall = TimeSpan.FromSeconds(5);
+
+    /// <summary>No sign of life from the window for this long means the app has stopped responding.</summary>
+    private static readonly TimeSpan UiStall = TimeSpan.FromSeconds(6);
+
+    /// <summary>How long the input must stay quiet before the phrase so far is transcribed.</summary>
+    private static readonly int PauseSamples = AudioChunk.SampleRate;
+
+    /// <summary>Shorter than this is a click, not a phrase, and is not sent on its own.</summary>
+    private static readonly int MinimumSpeechSamples = AudioChunk.SampleRate / 5;
+
+    /// <summary>
+    /// A chunk at least this loud counts as speech.
+    /// </summary>
+    /// <remarks>
+    /// About −50 dBFS. A quiet room on a headset sits nearer −60 dBFS, and a soft voice is
+    /// often only a little above that. The previous −40 dBFS gate was dropping those words
+    /// before they ever reached the model.
+    /// </remarks>
+    private const float SpeechRms = 0.003f;
+
+    /// <summary>Quiet phrases are raised to about this level before transcription.</summary>
+    private const float TargetSpeechRms = 0.05f;
+
+    /// <summary>Upper bound on that lift, so a noise floor is not turned into a shout.</summary>
+    private const float MaxQuietGain = 16f;
 
     private readonly SemaphoreSlim _gate = new(1, 1);
     private CancellationTokenSource? _recording;
     private List<float>? _buffer;
+    private int _speechSamples;
+    private int _silenceSamples;
+    private Channel<Utterance>? _pending;
+    private Task? _transcription;
     private DateTimeOffset _startedAt;
+    private long _lastAudioTicks;
+    private long _lastUiTicks;
+    private int _sawUi;
+    private int _voiceStop;
+    private int _interrupted;
+
+    private readonly record struct Utterance(List<float> Samples, bool TrailingSpace);
 
     /// <summary>Current state.</summary>
     public DictationState State { get; private set; } = DictationState.Idle;
@@ -76,23 +119,30 @@ public sealed class DictationEngine : IAsyncDisposable
     /// a restart.
     /// </param>
     /// <param name="clock">Time source; defaults to the system clock.</param>
+    /// <param name="cues">Stop and failure sounds. Omitted in tests that do not care.</param>
+    /// <param name="recordCue">
+    /// Armed and model-ready sounds. Omitted in tests that do not care.
+    /// </param>
     public DictationEngine(
         IAudioCapture capture,
         IHotkeySource hotkey,
         ITranscriber transcriber,
         ITextInjector injector,
         Func<IReadOnlyList<DictionaryEntry>> dictionary,
-        IClock? clock = null)
+        IClock? clock = null,
+        ISessionCue? cues = null,
+        IRecordCue? recordCue = null)
     {
         _capture = capture;
         _hotkey = hotkey;
         _transcriber = transcriber;
         _injector = injector;
         _dictionary = dictionary;
+        _cues = cues;
+        _recordCue = recordCue;
         _clock = clock ?? SystemClock.Instance;
 
         _hotkey.Pressed += OnPressed;
-        _hotkey.Released += OnReleased;
     }
 
     /// <summary>Arms the hotkey.</summary>
@@ -100,11 +150,11 @@ public sealed class DictationEngine : IAsyncDisposable
     public bool Start() => _hotkey.Start();
 
     /// <summary>
-    /// Starts or stops recording from a button rather than the hotkey.
+    /// Starts recording, or stops it if it is already running.
     /// </summary>
     /// <remarks>
-    /// Routed through the same state machine as the hotkey, deliberately. Two independent
-    /// paths into recording would eventually disagree about whether it is running.
+    /// The hotkey and the on-screen key both come through here. Letting go of the hotkey
+    /// does not stop a take — a second press does.
     /// </remarks>
     public void TogglePushToTalk()
     {
@@ -112,9 +162,14 @@ public sealed class DictationEngine : IAsyncDisposable
         else if (State == DictationState.Recording) _ = EndAsync();
     }
 
-    private void OnPressed(object? sender, EventArgs e) => _ = BeginAsync();
+    private void OnPressed(object? sender, EventArgs e) => TogglePushToTalk();
 
-    private void OnReleased(object? sender, EventArgs e) => _ = EndAsync();
+    /// <summary>Tells the stall watch that the window is still responding.</summary>
+    public void NoteAlive()
+    {
+        _sawUi = 1;
+        Interlocked.Exchange(ref _lastUiTicks, _clock.Now.UtcTicks);
+    }
 
     private async Task BeginAsync()
     {
@@ -124,9 +179,24 @@ public sealed class DictationEngine : IAsyncDisposable
             if (State != DictationState.Idle) return;
 
             _buffer = [];
+            _speechSamples = 0;
+            _silenceSamples = 0;
+            _pending = Channel.CreateUnbounded<Utterance>(new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = true,
+            });
+            _transcription = TranscribeQueuedAsync(_pending.Reader);
             _startedAt = _clock.Now;
+            _voiceStop = 0;
+            _interrupted = 0;
+            TouchAudio();
+            _cues?.SetRecording(true);
             _recording = new CancellationTokenSource();
+            var watch = WatchAsync(_recording.Token);
             SetState(DictationState.Recording);
+            _ = watch;
+            if (_recordCue is not null) _ = Task.Run(AnnounceReadyAsync);
         }
         finally
         {
@@ -143,16 +213,80 @@ public sealed class DictationEngine : IAsyncDisposable
                 // already been zeroed.
                 if (State != DictationState.Recording) break;
 
-                // Copied, not referenced: capture implementations are entitled to reuse
-                // their buffer the moment this returns.
-                _buffer?.AddRange(chunk.Samples.Span);
-                Level = chunk.Rms();
+                var rms = chunk.Rms();
+                TouchAudio();
+                await _gate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (State != DictationState.Recording || _buffer is null) break;
+
+                    // Leading quiet is not part of a phrase. Once speech has started, quiet
+                    // is kept until it lasts long enough to count as a pause.
+                    if (rms < SpeechRms && _speechSamples == 0) 
+                    {
+                        Level = rms;
+                    }
+                    else
+                    {
+                        _buffer.AddRange(chunk.Samples.Span);
+                        if (rms >= SpeechRms)
+                        {
+                            _speechSamples += chunk.Samples.Length;
+                            _silenceSamples = 0;
+                        }
+                        else
+                        {
+                            _silenceSamples += chunk.Samples.Length;
+                            if (_silenceSamples >= PauseSamples)
+                            {
+                                if (_speechSamples >= MinimumSpeechSamples)
+                                {
+                                    _pending!.Writer.TryWrite(new Utterance(_buffer, TrailingSpace: true));
+                                }
+
+                                _buffer = [];
+                                _speechSamples = 0;
+                                _silenceSamples = 0;
+                            }
+                        }
+                    }
+
+                    Level = rms;
+                }
+                finally
+                {
+                    _gate.Release();
+                }
+
                 Changed?.Invoke(this, EventArgs.Empty);
             }
         }
         catch (OperationCanceledException)
         {
             // Normal: the key was released.
+        }
+        catch (Exception ex)
+        {
+            // Capture failed before any audio arrived. Leave the engine idle, otherwise the
+            // button stays on STOP and every later click only tries to finish an empty take.
+            Remember(ex);
+            SignalInterrupted();
+            if (_recording is not null) await _recording.CancelAsync().ConfigureAwait(false);
+            await _gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (State == DictationState.Recording)
+                {
+                    _buffer = null;
+                    _pending?.Writer.TryComplete();
+                    Level = 0;
+                    SetState(DictationState.Idle);
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
         }
         finally
         {
@@ -165,16 +299,23 @@ public sealed class DictationEngine : IAsyncDisposable
 
     private async Task EndAsync()
     {
-        List<float>? samples;
-
         await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (State != DictationState.Recording) return;
 
             await _recording!.CancelAsync().ConfigureAwait(false);
-            samples = _buffer;
+            // A deliberate stop sends whatever was said, however short. The minimum length
+            // applies only to a pause, so a click in a quiet room is not transcribed on its own.
+            if (_buffer is { Count: > 0 } && _speechSamples > 0 && _pending is not null)
+            {
+                _pending.Writer.TryWrite(new Utterance(_buffer, TrailingSpace: false));
+            }
+
             _buffer = null;
+            _speechSamples = 0;
+            _silenceSamples = 0;
+            _pending?.Writer.TryComplete();
             Level = 0;
             SetState(DictationState.Transcribing);
         }
@@ -185,24 +326,128 @@ public sealed class DictationEngine : IAsyncDisposable
 
         try
         {
-            await ProcessAsync(samples).ConfigureAwait(false);
+            if (_transcription is not null) await _transcription.ConfigureAwait(false);
         }
         finally
         {
             _recording?.Dispose();
             _recording = null;
+            _cues?.SetRecording(false);
             SetState(DictationState.Idle);
+            if (Interlocked.Exchange(ref _voiceStop, 0) == 1 && Volatile.Read(ref _interrupted) == 0)
+            {
+                _cues?.PlayStopped();
+            }
         }
     }
 
-    private async Task ProcessAsync(List<float>? samples)
+    private async Task WatchAsync(CancellationToken cancellationToken)
     {
-        if (samples is null || samples.Count == 0) return;
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                if (State != DictationState.Recording) continue;
+
+                _cues?.Pulse();
+                var now = _clock.Now.UtcTicks;
+                var audioStalled = now - Interlocked.Read(ref _lastAudioTicks) > AudioStall.Ticks;
+                var uiFrozen = _sawUi == 1 && now - Interlocked.Read(ref _lastUiTicks) > UiStall.Ticks;
+                if (audioStalled || uiFrozen) SignalInterrupted();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The take ended.
+        }
+    }
+
+    /// <summary>
+    /// Plays the armed tick immediately, then the ready tick once the model is actually loaded.
+    /// </summary>
+    /// <remarks>
+    /// A cold start loads while the take is already rolling, so the second tick waits.
+    /// A later take finds the model in memory and plays the two ticks back to back.
+    /// </remarks>
+    private async Task AnnounceReadyAsync()
+    {
+        try
+        {
+            _recordCue?.PlayRecording();
+
+            if (_transcriber.IsReady)
+            {
+                _recordCue?.PlayModelReady();
+                return;
+            }
+
+            // A second press during the load already played its armed tick. One waiter
+            // plays the ready tick, so the two presses do not each announce the load.
+            if (Interlocked.Exchange(ref _awaitingReadyCue, 1) != 0) return;
+
+            var loaded = await _transcriber.LoadAsync(CancellationToken.None).ConfigureAwait(false);
+            Interlocked.Exchange(ref _awaitingReadyCue, 0);
+            if (loaded) _recordCue?.PlayModelReady();
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref _awaitingReadyCue, 0);
+            Remember(ex);
+        }
+    }
+
+    private void TouchAudio() => Interlocked.Exchange(ref _lastAudioTicks, _clock.Now.UtcTicks);
+
+    /// <summary>Stops a take that the user ended by saying "stop recording".</summary>
+    private void RequestVoiceStop()
+    {
+        Interlocked.Exchange(ref _voiceStop, 1);
+        if (State == DictationState.Recording) _ = EndAsync();
+    }
+
+    /// <summary>The take failed or the app stopped responding. One cue per take.</summary>
+    private void SignalInterrupted()
+    {
+        if (Interlocked.Exchange(ref _interrupted, 1) != 0) return;
+
+        _cues?.SetRecording(false);
+        _cues?.PlayInterrupted();
+        if (State == DictationState.Recording) _ = EndAsync();
+    }
+
+    private async Task TranscribeQueuedAsync(ChannelReader<Utterance> pending)
+    {
+        await foreach (var utterance in pending.ReadAllAsync().ConfigureAwait(false))
+        {
+            try
+            {
+                await ProcessAsync(utterance).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Remember(ex);
+            }
+        }
+    }
+
+    private async Task ProcessAsync(Utterance utterance)
+    {
+        var samples = utterance.Samples;
+        if (samples.Count == 0) return;
+
+        // The model is not loaded at startup. Without this, TranscribeAsync returns an empty
+        // string, Completed never fires, and no history file is written.
+        if (!_transcriber.IsReady)
+        {
+            var loaded = await _transcriber.LoadAsync(CancellationToken.None).ConfigureAwait(false);
+            if (!loaded) return;
+        }
 
         // Measured from key release, because that is the wait the user actually feels — and
         // it is the only figure on which a streaming and a batch engine compare honestly.
         var releasedAt = _clock.Now;
-        var audio = new ReadOnlyMemory<float>(samples.ToArray());
+        var audio = new ReadOnlyMemory<float>(LiftQuietSpeech(samples));
 
         var entries = _dictionary();
         var bias = DictionaryCorrector.BiasPhrases(entries);
@@ -225,16 +470,119 @@ public sealed class DictationEngine : IAsyncDisposable
         // The dictionary runs last and unconditionally. Biasing only raises the odds of the
         // right word; this is the pass that guarantees it.
         var (corrected, applied) = new DictionaryCorrector(entries).Apply(raw);
+        var commanded = ApplyStopCommand(ApplyLineBreakCommands(corrected), out var stop);
+        if (stop) RequestVoiceStop();
+        if (commanded.Length == 0) return;
 
         var result = new DictationResult(
             At: releasedAt,
             AudioDuration: TimeSpan.FromSeconds((double)audio.Length / AudioChunk.SampleRate),
             ProcessingTime: _clock.Now - releasedAt,
-            Text: corrected,
+            Text: commanded,
             Corrections: applied);
 
         Completed?.Invoke(this, result);
-        await _injector.InjectAsync(corrected, CancellationToken.None).ConfigureAwait(false);
+
+        var typed = utterance.TrailingSpace
+            && !commanded.EndsWith(' ')
+            && !commanded.EndsWith('\n')
+            && !commanded.EndsWith('\v')
+            ? commanded + " "
+            : commanded;
+        await _injector.InjectAsync(typed, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Turns "line break" into one newline and "line gap" into a vertical tab.
+    /// </summary>
+    /// <remarks>
+    /// The injector sends Enter for a newline and two Enters for a vertical tab. "line break
+    /// line break" stays two separate breaks, so it does not become a line gap. "line breaks"
+    /// and "line gaps" are left alone.
+    /// </remarks>
+    private static string ApplyLineBreakCommands(string text)
+    {
+        if (!text.Contains("line", StringComparison.OrdinalIgnoreCase)) return text;
+
+        var replaced = LineGapCommand.Replace(text, "\v");
+        replaced = LineBreakCommand.Replace(replaced, "\n");
+        replaced = SpacesAroundLineBreaks.Replace(replaced, "$1");
+        return replaced.Trim(' ');
+    }
+
+    private static readonly Regex LineGapCommand = new(
+        @"\bline[ \t-]*gap\b[.,!?;:]*",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    private static readonly Regex LineBreakCommand = new(
+        @"\bline[ \t-]*break\b[.,!?;:]*",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    private static readonly Regex SpacesAroundLineBreaks = new(
+        @"[^\S\n\v]*(\n|\v)[^\S\n\v]*",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Removes a spoken "stop recording". The caller ends the take; the words are not typed.
+    /// </summary>
+    private static string ApplyStopCommand(string text, out bool stop)
+    {
+        stop = false;
+        if (!text.Contains("stop", StringComparison.OrdinalIgnoreCase)) return text;
+
+        var replaced = StopRecordingCommand.Replace(text, " ");
+        stop = !string.Equals(replaced, text, StringComparison.Ordinal);
+        if (!stop) return text;
+
+        replaced = ExtraSpaces.Replace(replaced, " ");
+        return replaced.Trim(' ');
+    }
+
+    private static readonly Regex StopRecordingCommand = new(
+        @"\bstop[ \t-]*recording\b[.,!?;:]*",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    private static readonly Regex ExtraSpaces = new(
+        @"[ ]{2,}",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Raises a soft phrase toward a level the model reliably hears, and leaves a loud one alone.
+    /// </summary>
+    private static float[] LiftQuietSpeech(List<float> samples)
+    {
+        double sum = 0;
+        foreach (var sample in samples) sum += (double)sample * sample;
+
+        var rms = Math.Sqrt(sum / samples.Count);
+        if (rms < 1e-8) return samples.ToArray();
+
+        var gain = Math.Min(MaxQuietGain, TargetSpeechRms / rms);
+        if (gain <= 1) return samples.ToArray();
+
+        var lifted = new float[samples.Count];
+        for (var i = 0; i < samples.Count; i++)
+        {
+            lifted[i] = Math.Clamp(samples[i] * (float)gain, -1f, 1f);
+        }
+
+        return lifted;
+    }
+
+    private static void Remember(Exception ex)
+    {
+        try
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Murmur");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "last-error.txt"), ex.ToString());
+        }
+        catch (IOException)
+        {
+            // The recording already failed. Losing the note must not replace that error.
+        }
     }
 
     private void SetState(DictationState state)
@@ -247,7 +595,6 @@ public sealed class DictationEngine : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _hotkey.Pressed -= OnPressed;
-        _hotkey.Released -= OnReleased;
         _hotkey.Dispose();
 
         if (_recording is not null)

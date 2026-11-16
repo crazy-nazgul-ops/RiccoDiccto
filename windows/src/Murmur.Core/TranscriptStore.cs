@@ -104,6 +104,24 @@ public sealed class TranscriptStore
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
+    /// <summary>Replaces an existing record, matched on <see cref="TranscriptRecord.Id"/>.</summary>
+    /// <remarks>
+    /// One recording is a single history entry even when a pause transcribes it in pieces.
+    /// Later pieces update that entry rather than appending another.
+    /// </remarks>
+    public void Replace(TranscriptRecord record)
+    {
+        var index = _records.FindIndex(r => r.Id == record.Id);
+        if (index < 0)
+        {
+            Add(record);
+            return;
+        }
+
+        _records[index] = record;
+        Rewrite();
+    }
+
     /// <summary>Deletes one record.</summary>
     public void Remove(Guid id)
     {

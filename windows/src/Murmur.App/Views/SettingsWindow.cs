@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Platform;
 using Murmur.App.Controls;
 using Murmur.App.Design;
 using Murmur.Core;
@@ -39,7 +40,8 @@ public sealed class SettingsWindow : Window
     {
         _settings = settings;
 
-        Title = "Murmur Settings";
+        Title = "RiccoDiccto Settings";
+        Icon = new WindowIcon(AssetLoader.Open(new Uri("avares://Murmur.App/Assets/tray.ico")));
         Width = 540;
         SizeToContent = SizeToContent.Height;
         CanResize = false;
@@ -88,8 +90,9 @@ public sealed class SettingsWindow : Window
                 {
                     _keyRow,
                     _keyWarning,
-                    Note("Hold this key anywhere to dictate. The key is passed through to the "
-                       + "focused app rather than swallowed, so it never gets stuck down."),
+                    Note("Press this key to start recording, and press it again to stop. "
+                       + "The key is passed through to the focused app rather than swallowed, "
+                       + "so it never gets stuck down."),
                 },
             }),
 
@@ -104,14 +107,22 @@ public sealed class SettingsWindow : Window
                         v => Save(_settings.Data with { InjectText = v })),
                     Toggle("Keep a transcript history", _settings.Data.KeepHistory,
                         v => Save(_settings.Data with { KeepHistory = v })),
+                    Toggle("Keep RiccoDiccto in front while recording", _settings.Data.StayOnTopWhileRecording,
+                        v => Save(_settings.Data with { StayOnTopWhileRecording = v })),
                 },
             }),
         },
     };
 
-    private static StackPanel BuildModelSection()
+    private StackPanel BuildModelSection()
     {
-        var located = ParakeetTranscriber.Locate();
+        // A configured folder is the one the engine actually loads. Locate() only
+        // searches the default AppData and exe-relative paths, so a model kept
+        // elsewhere would otherwise show as missing.
+        var configured = _settings.Data.ModelDirectory;
+        var located = configured is not null && ParakeetTranscriber.IsComplete(configured)
+            ? configured
+            : ParakeetTranscriber.Locate();
         var found = located is not null;
 
         var status = new StackPanel
@@ -141,7 +152,7 @@ public sealed class SettingsWindow : Window
             // Showing the resolved path matters: "model not found" is unactionable without
             // knowing which directory was actually checked.
             ? Note($"Loaded from {located}")
-            : Note("Windows has no built-in speech engine equivalent to Apple's, so Murmur "
+            : Note("Windows has no built-in speech engine equivalent to Apple's, so RiccoDiccto "
                  + "cannot transcribe until the Parakeet model is downloaded (~661 MB). "
                  + "See docs/PARAKEET-WINDOWS.md. Expected in:\n"
                  + string.Join("\n", ParakeetTranscriber.DefaultSearchPaths()));

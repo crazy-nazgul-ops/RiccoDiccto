@@ -96,6 +96,34 @@ public interface ITranscriber : IAsyncDisposable
 }
 
 /// <summary>
+/// Sounds at the start of a take: the deck is rolling, and the model is ready.
+/// </summary>
+public interface IRecordCue
+{
+    /// <summary>The key went down and capture has started.</summary>
+    void PlayRecording();
+
+    /// <summary>The model is in memory. Played only after a load has actually finished.</summary>
+    void PlayModelReady();
+}
+
+/// <summary>Sounds that mean a recording ended, as opposed to text landing.</summary>
+public interface ISessionCue
+{
+    /// <summary>The spoken "stop recording" command ended the take.</summary>
+    void PlayStopped();
+
+    /// <summary>The take died: capture failed, the window stopped responding, or the process crashed.</summary>
+    void PlayInterrupted();
+
+    /// <summary>Notes that a take is in progress, so a crash can still be heard.</summary>
+    void SetRecording(bool recording);
+
+    /// <summary>Refreshes the in-progress mark. A stale mark means the process has hung.</summary>
+    void Pulse();
+}
+
+/// <summary>
 /// Wall-clock time, behind an interface so timing logic is testable.
 /// </summary>
 /// <remarks>

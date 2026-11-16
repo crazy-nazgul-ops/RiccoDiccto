@@ -8,17 +8,18 @@ using Murmur.App.Design;
 namespace Murmur.App.Controls;
 
 /// <summary>
-/// A brushed-metal panel.
+/// A panel. The working face is brushed metal. The transport face is a flat night ground
+/// with a few brass points and a brass top edge.
 /// </summary>
-/// <remarks>
-/// The grain is drawn, not an image: it stays sharp at any scale, follows the silver/black
-/// face automatically, and adds nothing to the download.
-/// </remarks>
 public sealed class BrushedPanel : Decorator
 {
     /// <summary>Corner radius of the panel.</summary>
     public static readonly StyledProperty<double> CornerRadiusProperty =
         AvaloniaProperty.Register<BrushedPanel, double>(nameof(CornerRadius), Tokens.Radius.Panel);
+
+    /// <summary>Night ground and brass edge, instead of the brushed working panel.</summary>
+    public static readonly StyledProperty<bool> IsTransportFaceProperty =
+        AvaloniaProperty.Register<BrushedPanel, bool>(nameof(IsTransportFace));
 
     /// <inheritdoc cref="CornerRadiusProperty"/>
     public double CornerRadius
@@ -27,7 +28,14 @@ public sealed class BrushedPanel : Decorator
         set => SetValue(CornerRadiusProperty, value);
     }
 
-    static BrushedPanel() => AffectsRender<BrushedPanel>(CornerRadiusProperty);
+    /// <inheritdoc cref="IsTransportFaceProperty"/>
+    public bool IsTransportFace
+    {
+        get => GetValue(IsTransportFaceProperty);
+        set => SetValue(IsTransportFaceProperty, value);
+    }
+
+    static BrushedPanel() => AffectsRender<BrushedPanel>(CornerRadiusProperty, IsTransportFaceProperty);
 
     /// <inheritdoc />
     public override void Render(DrawingContext context)
@@ -36,30 +44,58 @@ public sealed class BrushedPanel : Decorator
         if (bounds.Width <= 0 || bounds.Height <= 0) return;
 
         var shape = new RoundedRect(bounds, CornerRadius);
-        context.DrawRectangle(Tokens.Brushes.Panel, null, shape);
+        var face = IsTransportFace ? Tokens.Brushes.Transport : Tokens.Brushes.Panel;
+        var highlight = IsTransportFace ? Tokens.Colors.TransportSeam : Tokens.Colors.PanelHighlight;
+        var seamColor = IsTransportFace ? Tokens.Colors.TransportSeam : Tokens.Colors.Seam;
+        context.DrawRectangle(face, null, shape);
 
         using (context.PushClip(bounds))
         {
-            // Fine horizontal striations — the direction a rolled aluminium sheet is brushed.
-            var light = new SolidColorBrush(Avalonia.Media.Colors.White, Tokens.Material.GrainLight);
-            var dark = new SolidColorBrush(Avalonia.Media.Colors.Black, Tokens.Material.GrainDark);
-            var alternate = false;
-
-            for (var y = 0.0; y < bounds.Height; y += Tokens.Material.GrainPitch)
-            {
-                context.FillRectangle(
-                    alternate ? dark : light,
-                    new Rect(0, y, bounds.Width, Tokens.Material.GrainPitch / 2));
-                alternate = !alternate;
-            }
+            if (IsTransportFace) DrawStars(context, bounds);
+            else DrawGrain(context, bounds);
         }
 
-        // Top bevel catches the light; the whole edge carries a seam.
-        var bevel = new Pen(new SolidColorBrush(Tokens.Colors.PanelHighlight, 0.5), Tokens.Border.Bevel);
+        // Top edge catches the light; the whole edge carries a seam.
+        var bevel = new Pen(new SolidColorBrush(highlight, IsTransportFace ? 1 : 0.5), Tokens.Border.Bevel);
         context.DrawLine(bevel, bounds.TopLeft, bounds.TopRight);
 
-        var seam = new Pen(new SolidColorBrush(Tokens.Colors.Seam, 0.35), Tokens.Border.Seam);
+        var seam = new Pen(new SolidColorBrush(seamColor, IsTransportFace ? 0.65 : 0.35), Tokens.Border.Seam);
         context.DrawRectangle(null, seam, shape);
+    }
+
+    /// <summary>Fine horizontal striations — the direction a rolled aluminium sheet is brushed.</summary>
+    private static void DrawGrain(DrawingContext context, Rect bounds)
+    {
+        var light = new SolidColorBrush(Avalonia.Media.Colors.White, Tokens.Material.GrainLight);
+        var dark = new SolidColorBrush(Avalonia.Media.Colors.Black, Tokens.Material.GrainDark);
+        var alternate = false;
+
+        for (var y = 0.0; y < bounds.Height; y += Tokens.Material.GrainPitch)
+        {
+            context.FillRectangle(
+                alternate ? dark : light,
+                new Rect(0, y, bounds.Width, Tokens.Material.GrainPitch / 2));
+            alternate = !alternate;
+        }
+    }
+
+    /// <summary>A few brass points on the night ground. Flat ink, not a glow.</summary>
+    private static void DrawStars(DrawingContext context, Rect bounds)
+    {
+        var ink = new SolidColorBrush(Tokens.Colors.TransportSeam, Tokens.Material.StarOpacity);
+        var pitch = Tokens.Material.StarPitch;
+        var n = 0;
+
+        for (var y = pitch; y < bounds.Height; y += pitch)
+        {
+            for (var x = pitch; x < bounds.Width; x += pitch)
+            {
+                n++;
+                if (n % 3 != 0) continue;
+
+                context.FillRectangle(ink, new Rect(x, y, Tokens.Border.Hairline, Tokens.Border.Hairline));
+            }
+        }
     }
 }
 
@@ -189,6 +225,10 @@ public sealed class TransportKey : Button
     public static readonly StyledProperty<bool> IsEngagedProperty =
         AvaloniaProperty.Register<TransportKey, bool>(nameof(IsEngaged));
 
+    /// <summary>Whether this key wears the sand cap and brass rim of the transport strip.</summary>
+    public static readonly StyledProperty<bool> IsDesertFaceProperty =
+        AvaloniaProperty.Register<TransportKey, bool>(nameof(IsDesertFace));
+
     /// <summary>Label colour when engaged.</summary>
     public static readonly StyledProperty<Color> EngagedColorProperty =
         AvaloniaProperty.Register<TransportKey, Color>(nameof(EngagedColor), Tokens.Colors.Record);
@@ -200,6 +240,13 @@ public sealed class TransportKey : Button
         set => SetValue(IsEngagedProperty, value);
     }
 
+    /// <inheritdoc cref="IsDesertFaceProperty"/>
+    public bool IsDesertFace
+    {
+        get => GetValue(IsDesertFaceProperty);
+        set => SetValue(IsDesertFaceProperty, value);
+    }
+
     /// <inheritdoc cref="EngagedColorProperty"/>
     public Color EngagedColor
     {
@@ -207,7 +254,7 @@ public sealed class TransportKey : Button
         set => SetValue(EngagedColorProperty, value);
     }
 
-    static TransportKey() => AffectsRender<TransportKey>(IsEngagedProperty, IsPressedProperty);
+    static TransportKey() => AffectsRender<TransportKey>(IsEngagedProperty, IsPressedProperty, IsDesertFaceProperty);
 
     /// <summary>Creates a key at the token dimensions.</summary>
     public TransportKey()
@@ -237,13 +284,16 @@ public sealed class TransportKey : Button
             : bounds;
         var shape = new RoundedRect(sunk, Tokens.Radius.Control);
 
-        context.DrawRectangle(Tokens.Brushes.Cap, null, shape);
+        context.DrawRectangle(IsDesertFace ? Tokens.Brushes.TransportCap : Tokens.Brushes.Cap, null, shape);
 
         // Bevel: highlight on top when proud, shade on top when pressed.
-        var bevelColor = IsPressed ? Tokens.Colors.PanelShade : Tokens.Colors.PanelHighlight;
+        var bevelColor = IsPressed
+            ? (IsDesertFace ? Tokens.Colors.TransportShade : Tokens.Colors.PanelShade)
+            : (IsDesertFace ? Tokens.Colors.TransportHighlight : Tokens.Colors.PanelHighlight);
         context.DrawRectangle(null, new Pen(new SolidColorBrush(bevelColor), Tokens.Border.Bevel), shape);
 
-        var seam = new Pen(new SolidColorBrush(Tokens.Colors.Seam, 0.5), Tokens.Border.Hairline);
+        var seamColor = IsDesertFace ? Tokens.Colors.TransportSeam : Tokens.Colors.Seam;
+        var seam = new Pen(new SolidColorBrush(seamColor, IsDesertFace ? 1 : 0.5), Tokens.Border.Hairline);
         context.DrawRectangle(null, seam, shape);
     }
 
@@ -256,24 +306,26 @@ public sealed class TransportKey : Button
         // pass invalidates the visual mid-pass, and Avalonia throws "Visual was invalidated
         // during the render pass" rather than merely logging it. Render must be a pure
         // function of current state.
-        if (change.Property == IsEngagedProperty || change.Property == EngagedColorProperty)
+        if (change.Property == IsEngagedProperty
+            || change.Property == EngagedColorProperty
+            || change.Property == IsDesertFaceProperty)
         {
-            Foreground = new SolidColorBrush(IsEngaged ? EngagedColor : Tokens.Colors.Ink);
+            var ink = IsDesertFace ? Tokens.Colors.TransportBrass : Tokens.Colors.Ink;
+            Foreground = new SolidColorBrush(IsEngaged ? EngagedColor : ink);
         }
     }
 }
 
 /// <summary>
-/// A VU meter with a real needle.
+/// A level display drawn as a traveling wave.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The needle is damped rather than driven straight from the signal. A physical VU movement
-/// takes ~300 ms to reach a step and overshoots slightly before settling, and that lag is the
-/// instrument's character.
+/// The height of the wave follows the input. Silence is a flat line. Speech lifts it.
+/// Loud input crosses into amber at <see cref="Tokens.Material.MeterZeroPoint"/>.
 /// </para>
 /// <para>
-/// The physics live in plain fields stepped by a timer, deliberately kept out of the property
+/// The motion lives in plain fields stepped by a timer, deliberately kept out of the property
 /// system: a styled property invalidated 60 times a second would push a full layout pass each
 /// frame for a value only this control's <c>Render</c> ever reads.
 /// </para>
@@ -284,7 +336,7 @@ public sealed class VuMeter : Control
     public static readonly StyledProperty<double> LevelProperty =
         AvaloniaProperty.Register<VuMeter, double>(nameof(Level));
 
-    /// <summary>Whether the meter lamp is lit.</summary>
+    /// <summary>Whether the display is live.</summary>
     public static readonly StyledProperty<bool> IsActiveProperty =
         AvaloniaProperty.Register<VuMeter, bool>(nameof(IsActive));
 
@@ -302,8 +354,9 @@ public sealed class VuMeter : Control
         set => SetValue(IsActiveProperty, value);
     }
 
-    private double _needle;
+    private double _amplitude;
     private double _velocity;
+    private double _phase;
     private DispatcherTimer? _ticker;
 
     static VuMeter() => AffectsRender<VuMeter>(IsActiveProperty);
@@ -317,7 +370,7 @@ public sealed class VuMeter : Control
         {
             Interval = TimeSpan.FromMilliseconds(16),
         };
-        _ticker.Tick += (_, _) => { AdvanceNeedle(); InvalidateVisual(); };
+        _ticker.Tick += (_, _) => { Advance(); InvalidateVisual(); };
         _ticker.Start();
     }
 
@@ -329,17 +382,18 @@ public sealed class VuMeter : Control
         base.OnDetachedFromVisualTree(e);
     }
 
-    /// <summary>Steps the movement one frame toward the current level.</summary>
-    private void AdvanceNeedle()
+    /// <summary>Steps the wave's height toward the current level, and rolls it forward.</summary>
+    private void Advance()
     {
-        var target = Math.Clamp(Level, 0, 1);
-        var rising = target > _needle;
+        var target = IsActive ? Math.Clamp(Level, 0, 1) : 0;
+        var rising = target > _amplitude;
         var time = rising ? Tokens.Motion.NeedleAttackSeconds : Tokens.Motion.NeedleReleaseSeconds;
 
         var stiffness = 1 / time;
-        _velocity += (target - _needle) * stiffness * 0.16;
+        _velocity += (target - _amplitude) * stiffness * 0.16;
         _velocity *= 0.72;
-        _needle = Math.Clamp(_needle + _velocity, 0, 1 + Tokens.Motion.NeedleOvershoot);
+        _amplitude = Math.Clamp(_amplitude + _velocity, 0, 1 + Tokens.Motion.NeedleOvershoot);
+        _phase += Tokens.Material.WaveSpeed;
     }
 
     /// <inheritdoc />
@@ -348,54 +402,38 @@ public sealed class VuMeter : Control
         var bounds = new Rect(Bounds.Size);
         if (bounds.Width <= 0 || bounds.Height <= 0) return;
 
-        context.DrawRectangle(
-            Tokens.Brushes.MeterFace, null, new RoundedRect(bounds, Tokens.Radius.Chip));
+        var shape = new RoundedRect(bounds, Tokens.Radius.Chip);
+        context.DrawRectangle(Tokens.Brushes.TransportDeck, null, shape);
 
-        if (IsActive)
+        var mid = bounds.Top + (bounds.Height / 2);
+        var baseline = new Pen(new SolidColorBrush(Tokens.Colors.TransportSeam), Tokens.Border.Hairline);
+        context.DrawLine(baseline, new Point(bounds.Left, mid), new Point(bounds.Right, mid));
+
+        var reach = _amplitude * ((bounds.Height / 2) - Tokens.Space.Tight);
+        if (reach >= Tokens.Border.Hairline)
         {
-            var lamp = new SolidColorBrush(Tokens.Colors.MeterLamp, 0.14);
-            context.DrawRectangle(lamp, null, new RoundedRect(bounds, Tokens.Radius.Chip));
+            var loud = _amplitude >= Tokens.Material.MeterZeroPoint;
+            var ink = loud ? Tokens.Colors.MeterAmber : Tokens.Colors.MeterGreen;
+            var trace = new Pen(new SolidColorBrush(ink), Tokens.Material.NeedleWidth);
+            var cycles = Tokens.Material.WaveCycles * Math.PI * 2;
+            Point? previous = null;
+
+            for (var x = bounds.Left; x <= bounds.Right; x += Tokens.Space.Hair)
+            {
+                var along = (x - bounds.Left) / bounds.Width;
+                var y = mid - (Math.Sin((along * cycles) + _phase) * reach);
+                var point = new Point(x, y);
+                if (previous is Point from) context.DrawLine(trace, from, point);
+                previous = point;
+            }
         }
 
-        // The pivot sits just below the face, so the needle sweeps across it like a real
-        // moving-coil movement rather than rotating about its centre.
-        var pivot = new Point(bounds.Width / 2, bounds.Height * 1.05);
-        var radius = Math.Min(bounds.Width * 0.46, bounds.Height * 0.92);
-        var sweep = Tokens.Material.NeedleSweepDegrees * Math.PI / 180;
-
-        var scalePen = new Pen(new SolidColorBrush(Tokens.Colors.MeterNeedle), Tokens.Border.Hairline);
-        var overPen = new Pen(new SolidColorBrush(Tokens.Colors.MeterRed), Tokens.Border.Hairline);
-
-        for (var tick = 0.0; tick <= 1.0001; tick += 0.1)
-        {
-            var angle = -sweep / 2 + (sweep * tick);
-            var major = tick % 0.2 < 0.01;
-            var inner = radius * (major ? 0.78 : 0.86);
-
-            context.DrawLine(
-                tick >= Tokens.Material.MeterZeroPoint ? overPen : scalePen,
-                Polar(pivot, angle, inner),
-                Polar(pivot, angle, radius));
-        }
-
-        var needleAngle = -sweep / 2 + (sweep * _needle);
-        var needlePen = new Pen(
-            new SolidColorBrush(Tokens.Colors.MeterNeedle), Tokens.Material.NeedleWidth);
-        context.DrawLine(needlePen, pivot, Polar(pivot, needleAngle, radius * 0.98));
-
-        var frame = new Pen(new SolidColorBrush(Tokens.Colors.Seam), Tokens.Border.Hairline);
-        context.DrawRectangle(null, frame, new RoundedRect(bounds, Tokens.Radius.Chip));
+        var frame = new Pen(new SolidColorBrush(Tokens.Colors.TransportSeam), Tokens.Border.Hairline);
+        context.DrawRectangle(null, frame, shape);
     }
-
-    private static Point Polar(Point origin, double angle, double distance) =>
-        new(origin.X + (Math.Sin(angle) * distance), origin.Y - (Math.Cos(angle) * distance));
 }
 
-/// <summary>A run of ventilation slots.</summary>
-/// <remarks>
-/// Purely decorative, and deliberately so — real equipment has vents and fasteners, and their
-/// absence is one of the things that makes software look like software.
-/// </remarks>
+/// <summary>A run of small arches, the vent pattern on the transport strip.</summary>
 public sealed class Vents : Control
 {
     /// <summary>How many slots to draw.</summary>
@@ -419,15 +457,93 @@ public sealed class Vents : Control
     /// <inheritdoc />
     public override void Render(DrawingContext context)
     {
-        var brush = new SolidColorBrush(Tokens.Colors.Seam, 0.5);
+        var brush = new SolidColorBrush(Tokens.Colors.TransportSeam);
         var pitch = Tokens.Material.VentSlotWidth + Tokens.Material.VentSlotGap;
+        var width = Tokens.Material.VentSlotWidth;
+        var rise = width / 2;
 
         for (var i = 0; i < Count; i++)
         {
-            var slot = new Rect(
-                i * pitch, 0,
-                Tokens.Material.VentSlotWidth, Tokens.Material.VentSlotHeight);
-            context.DrawRectangle(brush, null, new RoundedRect(slot, 1.5));
+            var x = i * pitch;
+            var crown = new Point(x + rise, rise);
+            context.DrawEllipse(brush, null, crown, rise, rise);
+            context.FillRectangle(
+                brush,
+                new Rect(x, rise, width, Tokens.Material.VentSlotHeight - rise));
         }
     }
+}
+
+/// <summary>
+/// The counter window: a night field under a single arch, edged in brass.
+/// </summary>
+public sealed class ArchedReadout : Decorator
+{
+    /// <summary>Creates the window with the digits set below the arch.</summary>
+    public ArchedReadout()
+    {
+        Padding = new Thickness(Tokens.Space.Base, Tokens.Material.ArchRise, Tokens.Space.Base, Tokens.Space.Snug);
+    }
+
+    /// <inheritdoc />
+    public override void Render(DrawingContext context)
+    {
+        var bounds = new Rect(Bounds.Size);
+        if (bounds.Width <= 0 || bounds.Height <= 0) return;
+
+        var pen = new Pen(new SolidColorBrush(Tokens.Colors.TransportSeam), Tokens.Border.Hairline);
+        context.DrawGeometry(Tokens.Brushes.TransportDeck, pen, Arch(bounds));
+    }
+
+    /// <inheritdoc />
+    protected override Size MeasureOverride(Size availableSize)
+    {
+        var pad = Padding;
+        var child = Child;
+        if (child is null) return new Size(pad.Left + pad.Right, pad.Top + pad.Bottom);
+
+        child.Measure(Deflate(availableSize, pad));
+        return new Size(
+            child.DesiredSize.Width + pad.Left + pad.Right,
+            child.DesiredSize.Height + pad.Top + pad.Bottom);
+    }
+
+    /// <inheritdoc />
+    protected override Size ArrangeOverride(Size finalSize)
+    {
+        var pad = Padding;
+        Child?.Arrange(new Rect(
+            pad.Left,
+            pad.Top,
+            Math.Max(0, finalSize.Width - pad.Left - pad.Right),
+            Math.Max(0, finalSize.Height - pad.Top - pad.Bottom)));
+
+        Clip = Arch(new Rect(finalSize));
+        return finalSize;
+    }
+
+    private static StreamGeometry Arch(Rect bounds)
+    {
+        var rise = Math.Min(Tokens.Material.ArchRise, bounds.Height / 2);
+        var geometry = new StreamGeometry();
+        using (var figure = geometry.Open())
+        {
+            figure.BeginFigure(new Point(bounds.Left, bounds.Top + rise), true);
+            figure.ArcTo(
+                new Point(bounds.Right, bounds.Top + rise),
+                new Size(bounds.Width / 2, rise),
+                0,
+                false,
+                SweepDirection.Clockwise);
+            figure.LineTo(bounds.BottomRight);
+            figure.LineTo(bounds.BottomLeft);
+            figure.EndFigure(true);
+        }
+
+        return geometry;
+    }
+
+    private static Size Deflate(Size available, Thickness pad) => new(
+        Math.Max(0, available.Width - pad.Left - pad.Right),
+        Math.Max(0, available.Height - pad.Top - pad.Bottom));
 }

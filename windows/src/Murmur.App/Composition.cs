@@ -77,22 +77,49 @@ public sealed class Composition : IAsyncDisposable
                 ? new ParakeetTranscriber(modelDirectory)
                 : new UnavailableTranscriber();
 
+            var recordCue = PlatformFactory.CreateRecordCue();
             engine = new DictationEngine(
                 capture!, hotkey!, transcriber, injector!,
-                () => dictionary.Entries);
+                () => dictionary.Entries,
+                recordCue: recordCue);
 
+            // Pauses transcribe as they happen, but the list is one entry per recording.
+            TranscriptRecord? session = null;
+            engine.Changed += (_, _) =>
+            {
+                if (engine.State == DictationState.Idle) session = null;
+            };
             engine.Completed += (_, result) =>
             {
                 if (!settings.Data.KeepHistory) return;
 
-                transcripts.Add(new TranscriptRecord
+                if (session is null)
+                {
+                    session = new TranscriptRecord
+                    {
+                        At = result.At,
+                        AudioSeconds = result.AudioDuration.TotalSeconds,
+                        ProcessingSeconds = result.ProcessingTime.TotalSeconds,
+                        Text = result.Text,
+                        Corrections = result.Corrections.Count > 0 ? result.Corrections : null,
+                    };
+                    transcripts.Add(session);
+                    return;
+                }
+
+                var corrections = session.Corrections is null
+                    ? result.Corrections
+                    : session.Corrections.Concat(result.Corrections).ToList();
+
+                session = session with
                 {
                     At = result.At,
-                    AudioSeconds = result.AudioDuration.TotalSeconds,
-                    ProcessingSeconds = result.ProcessingTime.TotalSeconds,
-                    Text = result.Text,
-                    Corrections = result.Corrections.Count > 0 ? result.Corrections : null,
-                });
+                    AudioSeconds = session.AudioSeconds + result.AudioDuration.TotalSeconds,
+                    ProcessingSeconds = session.ProcessingSeconds + result.ProcessingTime.TotalSeconds,
+                    Text = session.Text + " " + result.Text,
+                    Corrections = corrections.Count > 0 ? corrections : null,
+                };
+                transcripts.Replace(session);
             };
         }
 

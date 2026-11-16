@@ -103,6 +103,31 @@ public sealed class FakeHotkeySource : IHotkeySource
     public void Dispose() => StopListening();
 }
 
+/// <summary>Records armed and model-ready cues in the order they were played.</summary>
+public sealed class CueLog : IRecordCue
+{
+    private readonly Lock _gate = new();
+    private readonly List<string> _events = [];
+
+    /// <summary>Cues played so far, in order.</summary>
+    public string[] Snapshot()
+    {
+        lock (_gate) return _events.ToArray();
+    }
+
+    /// <inheritdoc />
+    public void PlayRecording()
+    {
+        lock (_gate) _events.Add("recording");
+    }
+
+    /// <inheritdoc />
+    public void PlayModelReady()
+    {
+        lock (_gate) _events.Add("ready");
+    }
+}
+
 /// <summary>Returns canned transcripts and records what it was asked to transcribe.</summary>
 public sealed class FakeTranscriber : ITranscriber
 {
@@ -120,11 +145,20 @@ public sealed class FakeTranscriber : ITranscriber
     /// <inheritdoc />
     public bool IsReady { get; private set; }
 
+    /// <summary>When set, <see cref="LoadAsync"/> waits for it before becoming ready.</summary>
+    public Task? LoadDelay { get; set; }
+
+    /// <summary>When false, <see cref="LoadAsync"/> reports that the model is missing.</summary>
+    public bool CanLoad { get; set; } = true;
+
     /// <inheritdoc />
-    public ValueTask<bool> LoadAsync(CancellationToken cancellationToken)
+    public async ValueTask<bool> LoadAsync(CancellationToken cancellationToken)
     {
+        if (LoadDelay is not null) await LoadDelay.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!CanLoad) return false;
+
         IsReady = true;
-        return ValueTask.FromResult(true);
+        return true;
     }
 
     /// <inheritdoc />

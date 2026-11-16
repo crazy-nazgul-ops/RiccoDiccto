@@ -44,6 +44,7 @@ public sealed class ParakeetTranscriber : ITranscriber
     private const string ModelType = "nemo_transducer";
 
     private readonly string _modelDirectory;
+    private readonly SemaphoreSlim _loadGate = new(1, 1);
     private OfflineRecognizer? _recognizer;
 
     /// <summary>Points the engine at a folder of model files.</summary>
@@ -94,26 +95,38 @@ public sealed class ParakeetTranscriber : ITranscriber
     public bool IsReady => _recognizer is not null;
 
     /// <inheritdoc />
-    public ValueTask<bool> LoadAsync(CancellationToken cancellationToken)
+    public async ValueTask<bool> LoadAsync(CancellationToken cancellationToken)
     {
-        if (_recognizer is not null) return ValueTask.FromResult(true);
-        if (!IsComplete(_modelDirectory)) return ValueTask.FromResult(false);
+        if (_recognizer is not null) return true;
+        if (!IsComplete(_modelDirectory)) return false;
 
-        var config = new OfflineRecognizerConfig();
-        config.FeatConfig.SampleRate = AudioChunk.SampleRate;
-        config.FeatConfig.FeatureDim = FeatureDim;
+        // Record-start and the first transcription can both ask. One load, one recognizer.
+        await _loadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_recognizer is not null) return true;
+            if (!IsComplete(_modelDirectory)) return false;
 
-        config.ModelConfig.Transducer.Encoder = Path.Combine(_modelDirectory, "encoder.int8.onnx");
-        config.ModelConfig.Transducer.Decoder = Path.Combine(_modelDirectory, "decoder.int8.onnx");
-        config.ModelConfig.Transducer.Joiner = Path.Combine(_modelDirectory, "joiner.int8.onnx");
-        config.ModelConfig.Tokens = Path.Combine(_modelDirectory, "tokens.txt");
-        config.ModelConfig.ModelType = ModelType;
-        config.ModelConfig.NumThreads = Threads;
-        config.ModelConfig.Provider = "cpu";
-        config.DecodingMethod = "greedy_search";
+            var config = new OfflineRecognizerConfig();
+            config.FeatConfig.SampleRate = AudioChunk.SampleRate;
+            config.FeatConfig.FeatureDim = FeatureDim;
 
-        _recognizer = new OfflineRecognizer(config);
-        return ValueTask.FromResult(true);
+            config.ModelConfig.Transducer.Encoder = Path.Combine(_modelDirectory, "encoder.int8.onnx");
+            config.ModelConfig.Transducer.Decoder = Path.Combine(_modelDirectory, "decoder.int8.onnx");
+            config.ModelConfig.Transducer.Joiner = Path.Combine(_modelDirectory, "joiner.int8.onnx");
+            config.ModelConfig.Tokens = Path.Combine(_modelDirectory, "tokens.txt");
+            config.ModelConfig.ModelType = ModelType;
+            config.ModelConfig.NumThreads = Threads;
+            config.ModelConfig.Provider = "cpu";
+            config.DecodingMethod = "greedy_search";
+
+            _recognizer = new OfflineRecognizer(config);
+            return true;
+        }
+        finally
+        {
+            _loadGate.Release();
+        }
     }
 
     /// <inheritdoc />
@@ -143,6 +156,7 @@ public sealed class ParakeetTranscriber : ITranscriber
     {
         _recognizer?.Dispose();
         _recognizer = null;
+        _loadGate.Dispose();
         return ValueTask.CompletedTask;
     }
 }

@@ -24,6 +24,9 @@ public sealed record SettingsData
 
     /// <summary>Whether to keep a transcript history.</summary>
     public bool KeepHistory { get; init; } = true;
+
+    /// <summary>Whether the window stays above other apps while a recording is running.</summary>
+    public bool StayOnTopWhileRecording { get; init; } = true;
 }
 
 /// <summary>Settings, persisted as JSON.</summary>
@@ -68,8 +71,19 @@ public sealed class AppSettings
         {
             if (!File.Exists(path)) return new SettingsData();
 
-            return JsonSerializer.Deserialize(File.ReadAllText(path), SettingsJsonContext.Default.SettingsData)
-                   ?? new SettingsData();
+            var json = File.ReadAllText(path);
+            var data = JsonSerializer.Deserialize(json, SettingsJsonContext.Default.SettingsData)
+                       ?? new SettingsData();
+
+            // A file saved before this flag existed has no property, and the serializer
+            // reads a missing bool as false. The default is on.
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty(nameof(SettingsData.StayOnTopWhileRecording), out _))
+            {
+                data = data with { StayOnTopWhileRecording = true };
+            }
+
+            return data;
         }
         catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
         {

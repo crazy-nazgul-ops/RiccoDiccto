@@ -3,10 +3,12 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Platform;
 using Avalonia.Threading;
 using Murmur.App.Controls;
 using Murmur.App.Design;
 using Murmur.Core;
+using Murmur.Speech;
 
 namespace Murmur.App.Views;
 
@@ -36,9 +38,18 @@ public sealed class MainWindow : Window
     private readonly TransportKey _dictionaryKey;
     private readonly DispatcherTimer _counterTimer;
 
+    private readonly TransportKey _panelKey;
     private Control? _transcriptionsView;
     private Control? _dictionaryView;
+    private Control? _body;
     private DateTimeOffset? _startedAt;
+    private double _restHeight;
+    private double _restMinHeight;
+    private bool _folded;
+    private bool _panelOpen = true;
+    private bool _wasCapturing;
+    private bool _releasedTopmost;
+    private bool _settingsOpen;
 
     /// <summary>Builds a window with no engine behind it. Used by headless tests.</summary>
     public MainWindow() : this(null) { }
@@ -48,14 +59,30 @@ public sealed class MainWindow : Window
     {
         _composition = composition;
 
-        Title = "Murmur";
+        Title = "RiccoDiccto";
+        Icon = new WindowIcon(AssetLoader.Open(new Uri("avares://Murmur.App/Assets/tray.ico")));
         MinWidth = 720;
         MinHeight = 520;
         Width = 880;
         Height = 640;
+        _restHeight = Height;
+        _restMinHeight = MinHeight;
         Background = Tokens.Brushes.Chassis;
 
-        _recordKey = new TransportKey { Content = "RECORD" };
+        Activated += (_, _) =>
+        {
+            _releasedTopmost = false;
+            ApplyChrome();
+        };
+        Deactivated += (_, _) =>
+        {
+            // A click on the window behind has to be able to raise it. Forcing Topmost
+            // back on the next tick would swallow that click for the rest of the take.
+            if (IsCapturing) _releasedTopmost = true;
+            ApplyChrome();
+        };
+
+        _recordKey = new TransportKey { Content = "RECORD", IsDesertFace = true };
         _recordKey.Click += (_, _) => ToggleRecording();
 
         _recordLamp = new Lamp { LampColor = Tokens.Colors.Record };
@@ -71,6 +98,12 @@ public sealed class MainWindow : Window
 
         _transcriptionsKey = new TransportKey { Content = "TRANSCRIPTIONS", IsEngaged = true };
         _dictionaryKey = new TransportKey { Content = "DICTIONARY" };
+        _panelKey = new TransportKey { Content = "CLOSE", IsDesertFace = true };
+        _panelKey.Click += (_, _) =>
+        {
+            _panelOpen = !_panelOpen;
+            ApplyChrome();
+        };
         _transcriptionsKey.Click += (_, _) => ShowSection(transcriptions: true);
         _dictionaryKey.Click += (_, _) => ShowSection(transcriptions: false);
 
@@ -97,14 +130,17 @@ public sealed class MainWindow : Window
         var root = new DockPanel { Margin = new Thickness(Tokens.Space.Roomy) };
 
         root.Children.Add(Panels.Docked(BuildTransportPanel(), Dock.Top));
-        root.Children.Add(Panels.Docked(BuildSectionKeys(), Dock.Top));
 
-        if (_composition is not null && !Composition.IsModelInstalled)
+        var body = new DockPanel();
+        body.Children.Add(Panels.Docked(BuildSectionKeys(), Dock.Top));
+        if (_composition is not null && !ModelIsReady(_composition))
         {
-            root.Children.Add(Panels.Docked(BuildModelBanner(), Dock.Top));
+            body.Children.Add(Panels.Docked(BuildModelBanner(), Dock.Top));
         }
 
-        root.Children.Add(BuildWell(_sectionHost));
+        body.Children.Add(BuildWell(_sectionHost));
+        _body = body;
+        root.Children.Add(body);
         return root;
     }
 
@@ -130,15 +166,19 @@ public sealed class MainWindow : Window
                     Orientation = Orientation.Horizontal,
                     Spacing = Tokens.Space.Tight,
                     VerticalAlignment = VerticalAlignment.Center,
-                    Children = { _recordLamp, new Silkscreen { Text = "REC" } },
+                    Children =
+                    {
+                        _recordLamp,
+                        new Silkscreen { Text = "REC", Foreground = Tokens.Brushes.TransportBrass },
+                    },
                 },
             },
-        }));
+        }, Tokens.Brushes.TransportBrass));
 
-        row.Children.Add(Panels.Labelled("LEVEL", _meter));
-        row.Children.Add(Panels.Labelled("COUNTER", Deck(_counter)));
+        row.Children.Add(Panels.Labelled("LEVEL", _meter, Tokens.Brushes.TransportBrass));
+        row.Children.Add(Panels.Labelled("COUNTER", new ArchedReadout { Child = _counter }, Tokens.Brushes.TransportBrass));
 
-        var settings = new TransportKey { Content = "SETTINGS" };
+        var settings = new TransportKey { Content = "SETTINGS", IsDesertFace = true };
         settings.Click += (_, _) => ShowSettings();
 
         row.Children.Add(new StackPanel
@@ -146,10 +186,20 @@ public sealed class MainWindow : Window
             Orientation = Orientation.Horizontal,
             Spacing = Tokens.Space.Base,
             VerticalAlignment = VerticalAlignment.Bottom,
-            Children = { settings, new Vents { Count = 8, VerticalAlignment = VerticalAlignment.Center } },
+            Children =
+            {
+                _panelKey,
+                settings,
+                new Vents { Count = 8, VerticalAlignment = VerticalAlignment.Center },
+            },
         });
 
-        return new BrushedPanel { Child = row, Margin = new Thickness(0, 0, 0, Tokens.Space.Base) };
+        return new BrushedPanel
+        {
+            IsTransportFace = true,
+            Child = row,
+            Margin = new Thickness(0, 0, 0, Tokens.Space.Base),
+        };
     }
 
     private StackPanel BuildSectionKeys() => new()
@@ -159,6 +209,21 @@ public sealed class MainWindow : Window
         Margin = new Thickness(0, 0, 0, Tokens.Space.Base),
         Children = { _transcriptionsKey, _dictionaryKey },
     };
+
+    /// <summary>
+    /// Whether a complete Parakeet model is available to this session.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Composition.IsModelInstalled"/> only searches the default locations.
+    /// A model kept somewhere else is still usable when <see cref="SettingsData.ModelDirectory"/>
+    /// points at a complete folder, which is the path the engine loads.
+    /// </remarks>
+    private static bool ModelIsReady(Composition composition)
+    {
+        var configured = composition.Settings.Data.ModelDirectory;
+        return configured is not null && ParakeetTranscriber.IsComplete(configured)
+            || Composition.IsModelInstalled;
+    }
 
     /// <summary>
     /// A standing notice that the app cannot transcribe yet.
@@ -186,7 +251,7 @@ public sealed class MainWindow : Window
                 },
                 new TextBlock
                 {
-                    Text = "Speech model not installed — Murmur cannot transcribe yet. "
+                    Text = "Speech model not installed — RiccoDiccto cannot transcribe yet. "
                          + "See Settings, or docs/PARAKEET-WINDOWS.md.",
                     FontFamily = Tokens.Fonts.Grotesque,
                     FontSize = Tokens.Fonts.Label,
@@ -206,17 +271,6 @@ public sealed class MainWindow : Window
         BorderBrush = new SolidColorBrush(Tokens.Colors.Seam, 0.55),
         BorderThickness = new Thickness(Tokens.Border.Hairline),
         Padding = new Thickness(Tokens.Space.Hair),
-        Child = content,
-    };
-
-    /// <summary>The dark readout window of a tape deck.</summary>
-    private static Border Deck(Control content) => new()
-    {
-        Background = Tokens.Brushes.Deck,
-        CornerRadius = new CornerRadius(Tokens.Radius.Panel),
-        BorderBrush = new SolidColorBrush(Tokens.Colors.Seam),
-        BorderThickness = new Thickness(Tokens.Border.Hairline),
-        Padding = new Thickness(Tokens.Space.Base, Tokens.Space.Snug),
         Child = content,
     };
 
@@ -250,7 +304,78 @@ public sealed class MainWindow : Window
     private void ShowSettings()
     {
         if (_composition is null) return;
-        _ = new SettingsWindow(_composition.Settings).ShowDialog(this);
+
+        // The dialog takes focus. Folding the owner underneath it would hide the page
+        // the user just opened Settings from.
+        _settingsOpen = true;
+        var dialog = new SettingsWindow(_composition.Settings);
+        dialog.Closed += (_, _) =>
+        {
+            _settingsOpen = false;
+            ApplyChrome();
+        };
+        _ = dialog.ShowDialog(this);
+    }
+
+    /// <summary>The microphone is open. Transcription after the take does not count.</summary>
+    private bool IsCapturing =>
+        _composition?.Engine is { } engine
+            ? engine.State == DictationState.Recording
+            : IsRecording;
+
+    /// <summary>
+    /// Starting a take closes the lower panel. Stopping opens it again.
+    /// A click on the panel key does the same thing on its own.
+    /// </summary>
+    private void NoteCaptureEdge()
+    {
+        var capturing = IsCapturing;
+        if (capturing == _wasCapturing) return;
+
+        _wasCapturing = capturing;
+        _panelOpen = !capturing;
+        if (capturing) _releasedTopmost = false;
+    }
+
+    /// <summary>
+    /// The transport strip stays above other windows only while audio is being captured,
+    /// and only until the user clicks the window behind it.
+    /// </summary>
+    private void ApplyChrome()
+    {
+        NoteCaptureEdge();
+
+        var stayOnTop = IsCapturing
+            && !_releasedTopmost
+            && _composition?.Settings.Data.StayOnTopWhileRecording == true;
+        if (Topmost != stayOnTop) Topmost = stayOnTop;
+
+        _panelKey.Content = _panelOpen ? "CLOSE" : "OPEN";
+
+        // The dialog takes focus from this window. Shrinking the owner underneath it
+        // would hide the page the user just opened Settings from.
+        if (_settingsOpen) return;
+
+        var fold = !_panelOpen;
+        if (_body is not null) _body.IsVisible = !fold;
+        if (fold == _folded) return;
+
+        _folded = fold;
+        Background = fold ? Tokens.Brushes.TransportChassis : Tokens.Brushes.Chassis;
+
+        if (fold)
+        {
+            _restHeight = Height;
+            MinHeight = 0;
+            CanResize = false;
+            SizeToContent = SizeToContent.Height;
+            return;
+        }
+
+        SizeToContent = SizeToContent.Manual;
+        CanResize = true;
+        MinHeight = _restMinHeight;
+        Height = _restHeight;
     }
 
     /// <summary>Pulls state from the engine onto the panel.</summary>
@@ -263,9 +388,10 @@ public sealed class MainWindow : Window
             return;
         }
 
+        engine.NoteAlive();
         var recording = engine.State != DictationState.Idle;
 
-        _meter.Level = engine.Level;
+        _meter.Level = MeterLevel(engine.Level);
         _meter.IsActive = recording;
         _recordLamp.IsLit = engine.State == DictationState.Recording;
         _recordKey.IsEngaged = recording;
@@ -274,7 +400,24 @@ public sealed class MainWindow : Window
         if (recording && _startedAt is null) _startedAt = DateTimeOffset.Now;
         else if (!recording) _startedAt = null;
 
+        ApplyChrome();
+
         UpdateCounter();
+    }
+
+    /// <summary>
+    /// Maps a linear RMS to the meter's sweep.
+    /// </summary>
+    /// <remarks>
+    /// The face is −72…0 dBFS, so a soft voice around −45 dBFS sits clearly off the rest
+    /// instead of looking like silence.
+    /// </remarks>
+    private static double MeterLevel(float rms)
+    {
+        if (rms < 1e-6f) return 0;
+
+        var db = 20 * Math.Log10(rms);
+        return Math.Clamp((db + 72) / 72, 0, 1);
     }
 
     private void UpdateCounter()
@@ -298,6 +441,7 @@ public sealed class MainWindow : Window
             _recordLamp.IsLit = IsRecording;
             _meter.IsActive = IsRecording;
             _startedAt = IsRecording ? DateTimeOffset.Now : null;
+            ApplyChrome();
             return;
         }
 

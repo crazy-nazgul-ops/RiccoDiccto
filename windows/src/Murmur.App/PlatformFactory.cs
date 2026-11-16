@@ -32,15 +32,17 @@ internal static class PlatformFactory
     public static bool IsAvailable => Load() is not null;
 
     /// <summary>
-    /// Teaches the default load context to find the platform assembly beside the executable.
+    /// Teaches the default load context to find the platform assembly, and the libraries it
+    /// ships with, beside the executable.
     /// </summary>
     /// <remarks>
     /// <c>PublishSingleFile</c> only bundles assemblies the compiler knows about, and this
     /// one is deliberately invisible to it — that is what keeps <c>Murmur.App</c> on plain
-    /// <c>net10.0</c>. It therefore ships as a loose file next to the exe. Default probing
-    /// normally finds it, but a single-file host resolves differently enough that relying on
-    /// that alone is a bet — and losing it means the app starts fine and then does nothing
-    /// when the user presses the key. Explicit is cheaper than that failure.
+    /// <c>net10.0</c>. It therefore ships as a loose file next to the exe, and so do the
+    /// NAudio assemblies it captures and plays sound with. None of them are in the app's
+    /// dependency list, so the host will not probe for them. Closing the window is often
+    /// the first touch of <c>NAudio.Wasapi</c>, and a miss there is an unhandled exception
+    /// inside the window callback. Explicit is cheaper than that failure.
     /// </remarks>
     [UnconditionalSuppressMessage(
         "Trimming",
@@ -54,9 +56,9 @@ internal static class PlatformFactory
 
         AssemblyLoadContext.Default.Resolving += (context, name) =>
         {
-            if (!string.Equals(name.Name, AssemblyName, StringComparison.Ordinal)) return null;
+            if (string.IsNullOrEmpty(name.Name)) return null;
 
-            var candidate = System.IO.Path.Combine(AppContext.BaseDirectory, AssemblyName + ".dll");
+            var candidate = System.IO.Path.Combine(AppContext.BaseDirectory, name.Name + ".dll");
             return File.Exists(candidate) ? context.LoadFromAssemblyPath(candidate) : null;
         };
     }
@@ -90,6 +92,10 @@ internal static class PlatformFactory
     /// <summary>Creates the SendInput injector, or null off Windows.</summary>
     public static ITextInjector? CreateTextInjector() =>
         Create<ITextInjector>("SendInputTextInjector", []);
+
+    /// <summary>Creates the record-start sounds, or null off Windows.</summary>
+    public static IRecordCue? CreateRecordCue() =>
+        Create<IRecordCue>("RecordCue", []);
 
     [UnconditionalSuppressMessage(
         "Trimming",

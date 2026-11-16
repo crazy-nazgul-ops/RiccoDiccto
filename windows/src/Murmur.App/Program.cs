@@ -23,7 +23,23 @@ public static class Program
             return SelfTest.Run();
         }
 
-        return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+        if (args.Contains("--capture-smoke", StringComparer.OrdinalIgnoreCase))
+        {
+            return CaptureSmoke.Run();
+        }
+
+        // Self-test and capture-smoke must not take this lock: CI runs them while nothing
+        // else is open, and a developer may run them against an already-running app.
+        if (!SingleInstance.TryAcquire(out var instance) || instance is null)
+        {
+            SingleInstance.SignalShow();
+            return 0;
+        }
+
+        using (instance)
+        {
+            return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+        }
     }
 
     /// <summary>Configures Avalonia. Also used by the headless test host.</summary>

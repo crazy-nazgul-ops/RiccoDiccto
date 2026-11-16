@@ -26,14 +26,23 @@ public sealed class DictationEngineTests
         params DictionaryEntry[] dictionary) =>
         new(capture, hotkey, transcriber, injector, () => dictionary, new FakeClock());
 
-    /// <summary>Presses, waits for capture to drain, then releases.</summary>
+    private static DictationEngine Build(
+        IAudioCapture capture,
+        FakeHotkeySource hotkey,
+        FakeTranscriber transcriber,
+        RecordingTextInjector injector,
+        IRecordCue recordCue,
+        params DictionaryEntry[] dictionary) =>
+        new(capture, hotkey, transcriber, injector, () => dictionary, new FakeClock(), recordCue: recordCue);
+
+    /// <summary>Presses to start, waits for capture to drain, then presses again to stop.</summary>
     private static async Task DictateAsync(FakeHotkeySource hotkey, DictationEngine engine)
     {
         hotkey.Press();
         for (var i = 0; i < 2000 && engine.State != DictationState.Recording; i++) await Task.Yield();
         for (var i = 0; i < 20000 && engine.Level == 0; i++) await Task.Yield();
 
-        hotkey.Release();
+        hotkey.Press();
         for (var i = 0; i < 20000 && engine.State != DictationState.Idle; i++) await Task.Yield();
     }
 
@@ -62,6 +71,187 @@ public sealed class DictationEngineTests
     }
 
     [Fact]
+    public async Task A_one_second_pause_transcribes_while_recording_continues()
+    {
+        var samples = new List<float>();
+        samples.AddRange(ToneSamples(0.4));
+        samples.AddRange(new float[AudioChunk.SampleRate + (AudioChunk.SampleRate / 5)]);
+        samples.AddRange(ToneSamples(0.4));
+
+        var hotkey = new FakeHotkeySource();
+        var injector = new RecordingTextInjector();
+        await using var engine = Build(
+            new FakeAudioCapture(samples.ToArray()),
+            hotkey,
+            new FakeTranscriber("first", "second"),
+            injector);
+
+        var first = new TaskCompletionSource<DictationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        engine.Completed += (_, result) => first.TrySetResult(result);
+
+        hotkey.Press();
+        var finished = await Task.WhenAny(first.Task, Task.Delay(TimeSpan.FromSeconds(3)));
+        finished.ShouldBe(first.Task);
+
+        engine.State.ShouldBe(DictationState.Recording);
+        injector.Injected.ShouldBe(["first "]);
+
+        hotkey.Press();
+        for (var i = 0; i < 20000 && engine.State != DictationState.Idle; i++) await Task.Yield();
+
+        injector.Injected.Count.ShouldBe(2);
+        injector.Injected[1].ShouldBe("second");
+    }
+
+    private static float[] ToneSamples(double seconds)
+    {
+        var count = (int)(seconds * AudioChunk.SampleRate);
+        var samples = new float[count];
+        for (var i = 0; i < count; i++)
+        {
+            samples[i] = 0.5f * MathF.Sin(2 * MathF.PI * 440 * i / AudioChunk.SampleRate);
+        }
+
+        return samples;
+    }
+
+    [Fact]
+    public async Task Saying_line_break_inserts_a_line_break_for_each_one()
+    {
+        var hotkey = new FakeHotkeySource();
+        var injector = new RecordingTextInjector();
+        await using var engine = Build(
+            FakeAudioCapture.Tone(0.4), hotkey, new FakeTranscriber("hello line break line break there"), injector);
+
+        await DictateAsync(hotkey, engine);
+
+        injector.Injected.ShouldHaveSingleItem();
+        injector.Injected[0].ShouldBe("hello\n\nthere");
+    }
+
+    [Fact]
+    public async Task Saying_page_break_stays_words()
+    {
+        var hotkey = new FakeHotkeySource();
+        var injector = new RecordingTextInjector();
+        await using var engine = Build(
+            FakeAudioCapture.Tone(0.4), hotkey, new FakeTranscriber("hello page break there"), injector);
+
+        await DictateAsync(hotkey, engine);
+
+        injector.Injected.ShouldHaveSingleItem();
+        injector.Injected[0].ShouldBe("hello page break there");
+    }
+
+    [Fact]
+    public async Task Saying_line_gap_inserts_a_gap_distinct_from_two_line_breaks()
+    {
+        var hotkey = new FakeHotkeySource();
+        var injector = new RecordingTextInjector();
+        await using var engine = Build(
+            FakeAudioCapture.Tone(0.4), hotkey, new FakeTranscriber("hello line gap there"), injector);
+
+        await DictateAsync(hotkey, engine);
+
+        injector.Injected.ShouldHaveSingleItem();
+        injector.Injected[0].ShouldBe("hello\vthere");
+    }
+
+    [Fact]
+    public async Task Saying_click_stays_a_word()
+    {
+        var hotkey = new FakeHotkeySource();
+        var injector = new RecordingTextInjector();
+        await using var engine = Build(
+            FakeAudioCapture.Tone(0.4), hotkey, new FakeTranscriber("hello click there"), injector);
+
+        await DictateAsync(hotkey, engine);
+
+        injector.Injected.ShouldHaveSingleItem();
+        injector.Injected[0].ShouldBe("hello click there");
+    }
+
+    [Fact]
+    public async Task Quiet_speech_is_still_transcribed()
+    {
+        var hotkey = new FakeHotkeySource();
+        var injector = new RecordingTextInjector();
+
+        // Amplitude 0.008 is about −45 dBFS. The old gate treated that as silence.
+        await using var engine = Build(
+            FakeAudioCapture.Tone(0.4, 0.008f), hotkey, new FakeTranscriber("soft"), injector);
+
+        await DictateAsync(hotkey, engine);
+
+        injector.Injected.ShouldHaveSingleItem();
+        injector.Injected[0].ShouldBe("soft");
+    }
+
+    [Fact]
+    public async Task A_loaded_model_answers_with_both_sounds_when_recording_starts()
+    {
+        var hotkey = new FakeHotkeySource();
+        var transcriber = new FakeTranscriber("hi");
+        var cues = new CueLog();
+        await transcriber.LoadAsync(CancellationToken.None);
+
+        await using var engine = Build(
+            FakeAudioCapture.Tone(0.4), hotkey, transcriber, new RecordingTextInjector(), cues);
+
+        hotkey.Press();
+        var played = await WaitForCues(cues, 2);
+
+        played.ShouldBe(["recording", "ready"]);
+        engine.State.ShouldBe(DictationState.Recording);
+    }
+
+    [Fact]
+    public async Task The_ready_sound_waits_until_the_model_has_loaded()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hotkey = new FakeHotkeySource();
+        var transcriber = new FakeTranscriber("hi") { LoadDelay = gate.Task };
+        var cues = new CueLog();
+
+        await using var engine = Build(
+            FakeAudioCapture.Tone(1.5), hotkey, transcriber, new RecordingTextInjector(), cues);
+
+        hotkey.Press();
+        var armed = await WaitForCues(cues, 1);
+        armed.ShouldBe(["recording"]);
+
+        gate.TrySetResult();
+        var played = await WaitForCues(cues, 2);
+        played.ShouldBe(["recording", "ready"]);
+        engine.State.ShouldBe(DictationState.Recording);
+    }
+
+    [Fact]
+    public async Task A_missing_model_plays_the_armed_sound_only()
+    {
+        var hotkey = new FakeHotkeySource();
+        var transcriber = new FakeTranscriber("hi") { CanLoad = false };
+        var cues = new CueLog();
+
+        await using var engine = Build(
+            FakeAudioCapture.Tone(0.4), hotkey, transcriber, new RecordingTextInjector(), cues);
+
+        hotkey.Press();
+        var armed = await WaitForCues(cues, 1);
+        await Task.Delay(50);
+
+        armed.ShouldBe(["recording"]);
+        cues.Snapshot().ShouldBe(["recording"]);
+        engine.State.ShouldBe(DictationState.Recording);
+    }
+
+    private static async Task<string[]> WaitForCues(CueLog cues, int count)
+    {
+        for (var i = 0; i < 20000 && cues.Snapshot().Length < count; i++) await Task.Yield();
+        return cues.Snapshot();
+    }
+
+    [Fact]
     public async Task Silence_injects_nothing()
     {
         var hotkey = new FakeHotkeySource();
@@ -73,7 +263,7 @@ public sealed class DictationEngineTests
 
         hotkey.Press();
         for (var i = 0; i < 2000 && engine.State != DictationState.Recording; i++) await Task.Yield();
-        hotkey.Release();
+        hotkey.Press();
         for (var i = 0; i < 20000 && engine.State != DictationState.Idle; i++) await Task.Yield();
 
         injector.Injected.ShouldBeEmpty();
