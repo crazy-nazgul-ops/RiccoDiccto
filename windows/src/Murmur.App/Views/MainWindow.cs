@@ -46,7 +46,7 @@ public sealed class MainWindow : Window
     private double _restHeight;
     private double _restMinHeight;
     private bool _folded;
-    private bool _panelOpen = true;
+    private bool _panelOpen;
     private bool _wasCapturing;
     private bool _releasedTopmost;
     private bool _settingsOpen;
@@ -69,6 +69,9 @@ public sealed class MainWindow : Window
         _restMinHeight = MinHeight;
         Background = Tokens.Brushes.Chassis;
 
+        // SizeToContent set before the window exists does not shrink the first frame.
+        // The design height would otherwise stay, leaving an empty panel under the strip.
+        Opened += (_, _) => FitTransportStrip();
         Activated += (_, _) =>
         {
             _releasedTopmost = false;
@@ -98,7 +101,7 @@ public sealed class MainWindow : Window
 
         _transcriptionsKey = new TransportKey { Content = "TRANSCRIPTIONS", IsEngaged = true };
         _dictionaryKey = new TransportKey { Content = "DICTIONARY" };
-        _panelKey = new TransportKey { Content = "CLOSE", IsDesertFace = true };
+        _panelKey = new TransportKey { Content = "OPEN", IsDesertFace = true };
         _panelKey.Click += (_, _) =>
         {
             _panelOpen = !_panelOpen;
@@ -121,6 +124,7 @@ public sealed class MainWindow : Window
 
         Content = BuildLayout();
         ShowSection(transcriptions: true);
+        ApplyChrome();
 
         if (_composition?.Engine is not null) _composition.Engine.Start();
     }
@@ -324,8 +328,8 @@ public sealed class MainWindow : Window
             : IsRecording;
 
     /// <summary>
-    /// Starting a take closes the lower panel. Stopping opens it again.
-    /// A click on the panel key does the same thing on its own.
+    /// Starting a take folds the lower panel so the transport strip stays compact.
+    /// Stopping a take does not open it. The panel key is the only way to show it.
     /// </summary>
     private void NoteCaptureEdge()
     {
@@ -333,8 +337,10 @@ public sealed class MainWindow : Window
         if (capturing == _wasCapturing) return;
 
         _wasCapturing = capturing;
-        _panelOpen = !capturing;
-        if (capturing) _releasedTopmost = false;
+        if (!capturing) return;
+
+        _panelOpen = false;
+        _releasedTopmost = false;
     }
 
     /// <summary>
@@ -365,10 +371,11 @@ public sealed class MainWindow : Window
 
         if (fold)
         {
-            _restHeight = Height;
-            MinHeight = 0;
-            CanResize = false;
-            SizeToContent = SizeToContent.Height;
+            // A fixed Height locks the window at the design size, which is the empty
+            // black area under the strip. Only remember a height the user actually had
+            // while the transcriptions were open.
+            if (!double.IsNaN(Height) && Height >= _restMinHeight) _restHeight = Height;
+            FitTransportStrip();
             return;
         }
 
@@ -376,6 +383,33 @@ public sealed class MainWindow : Window
         CanResize = true;
         MinHeight = _restMinHeight;
         Height = _restHeight;
+        if (IsVisible)
+            ClientSize = new Size(ClientSize.Width, _restHeight);
+    }
+
+    /// <summary>
+    /// Wraps the window around the transport strip.
+    /// </summary>
+    /// <remarks>
+    /// A set height is a hard min and max, so sizing to content cannot shrink a window
+    /// that was created at the design size. Clearing that height lets the first frame
+    /// match a later close.
+    /// </remarks>
+    private void FitTransportStrip()
+    {
+        if (_panelOpen || _settingsOpen) return;
+
+        MinHeight = 0;
+        CanResize = false;
+        Height = double.NaN;
+        SizeToContent = SizeToContent.Height;
+
+        if (!IsVisible) return;
+
+        UpdateLayout();
+        var height = DesiredSize.Height;
+        if (height > 0 && !double.IsInfinity(height))
+            ClientSize = new Size(ClientSize.Width, height);
     }
 
     /// <summary>Pulls state from the engine onto the panel.</summary>

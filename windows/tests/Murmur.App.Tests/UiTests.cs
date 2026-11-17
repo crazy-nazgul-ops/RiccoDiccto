@@ -73,7 +73,7 @@ public sealed class MainWindowTests
     }
 
     [AvaloniaFact]
-    public void Panel_closes_on_its_own_and_recording_reopens_it()
+    public void Panel_starts_collapsed_and_stays_collapsed_after_recording()
     {
         var window = new MainWindow();
         window.Show();
@@ -93,24 +93,30 @@ public sealed class MainWindowTests
         }
 
         var transcriptions = Key("TRANSCRIPTIONS");
-        OnScreen(transcriptions).ShouldBeTrue();
-
-        Key("CLOSE").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
-        window.UpdateLayout();
-
         OnScreen(transcriptions).ShouldBeFalse();
+        window.ClientSize.Height.ShouldBeLessThan(520);
+
         Key("OPEN").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
         window.UpdateLayout();
         OnScreen(transcriptions).ShouldBeTrue();
+        window.MinHeight.ShouldBe(520);
+        window.ClientSize.Height.ShouldBeGreaterThanOrEqualTo(520);
 
+        Key("CLOSE").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        window.UpdateLayout();
+        OnScreen(transcriptions).ShouldBeFalse();
+        window.ClientSize.Height.ShouldBeLessThan(520);
+
+        Key("OPEN").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        window.UpdateLayout();
         window.ToggleRecording();
         window.UpdateLayout();
         OnScreen(transcriptions).ShouldBeFalse();
 
         window.ToggleRecording();
         window.UpdateLayout();
-        OnScreen(transcriptions).ShouldBeTrue();
-        window.MinHeight.ShouldBe(520);
+        OnScreen(transcriptions).ShouldBeFalse();
+        window.ClientSize.Height.ShouldBeLessThan(520);
     }
 
     [AvaloniaFact]
@@ -120,6 +126,13 @@ public sealed class MainWindowTests
         window.Show();
 
         window.MinWidth.ShouldBe(720);
+
+        window.GetVisualDescendants()
+            .OfType<TransportKey>()
+            .First(key => key.Content as string == "OPEN")
+            .RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        window.UpdateLayout();
+
         window.MinHeight.ShouldBe(520);
     }
 

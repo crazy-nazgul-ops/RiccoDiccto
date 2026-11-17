@@ -39,6 +39,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
 
+    <Version>0.2.0</Version>
     <Company>Pivot Studio</Company>
     <Product>Murmur</Product>
     <Copyright>Copyright © Pat Simmons</Copyright>
